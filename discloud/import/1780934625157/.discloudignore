@@ -1,0 +1,9 @@
+# Byte-compiled files
+__pycache__
+
+# Virtual environments
+venv
+.env
+npa
+uv.lock
+pyproject.toml

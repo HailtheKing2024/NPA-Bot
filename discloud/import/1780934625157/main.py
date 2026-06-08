@@ -43,8 +43,6 @@ async def submit_match(
 
     winners_score = 11
     npr_winner, npr_loser = calculate_npr(winners_score, losers_score)
-    if npr_winner > 6:
-        npr_winner = 6
 
 
     message = f"**{winners_name}** gains {npr_winner} npr and **{losers_name}** loses {npr_loser} npr"
