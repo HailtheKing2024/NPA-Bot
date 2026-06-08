@@ -1,9 +1,12 @@
 # Byte-compiled files
-__pycache__
+__pycache__/
 
 # Virtual environments
-venv
+.venv/
+venv/
 .env
-npa
+
+# Build and local tool caches
+.discloud/
+.git/
 uv.lock
-pyproject.toml

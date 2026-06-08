@@ -9,7 +9,7 @@ def calculate_npr(score_a, score_b):
 
     rating_a = max(0, min(10, rating_a))
     rating_b = max(0, min(10, rating_b))
-    return round(rating_a,), round(rating_b)
+    return round(rating_a), round(rating_b)
 
 
 
@@ -43,9 +43,6 @@ async def submit_match(
 
     winners_score = 11
     npr_winner, npr_loser = calculate_npr(winners_score, losers_score)
-    if npr_winner > 6:
-        npr_winner = 6
-
 
     message = f"**{winners_name}** gains {npr_winner} npr and **{losers_name}** loses {npr_loser} npr"
     
