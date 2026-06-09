@@ -13,3 +13,4 @@ npa
 
 # Local runtime logs
 server.log
+.env
