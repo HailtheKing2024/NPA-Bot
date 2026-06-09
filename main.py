@@ -144,7 +144,7 @@ SHEETDB_URL = "https://sheetdb.io/api/v1/ra1bgaunuflkm"
     losers_name="The name of the losing player/team (e.g., Kyle C, Maximus L)",
     losers_score="The score of the losing team (0 to 9 for a normal game, > 11 for a deuce game)"
 )
-async def submit_match(
+async def submit_match_singles(
     interaction: discord.Interaction,
     winners_name: str,
     losers_name: str,
@@ -231,6 +231,129 @@ async def submit_match(
     except Exception as e:
         await interaction.followup.send(f"An unexpected error occurred: {str(e)}")
 
+@client.tree.command(name="doubles", description="Logs match details, alters statistics, and parses system rank updates. (Doubles version)")
+@app_commands.describe(
+    winners_name_1="The name of the first player on the winning team (e.g., Kyle C, Maximus L)",
+    winners_name_2="The name of the second player on the winning team (e.g., Kyle C, Maximus L)",
+    losers_name_1="The name of the first player on the losing team (e.g., Kyle C, Maximus L)",
+    losers_name_2="The name of the second player on the losing team (e.g., Kyle C, Maximus L)",
+    losers_score="The score of the losing team (0 to 9 for a normal game, > 11 for a deuce game)"
+)
+async def submit_match_doubles(
+    interaction: discord.Interaction,
+    winners_name_1: str,
+    winners_name_2:str,
+    losers_name_1: str,
+    losers_name_2:str,
+    losers_score: int
+):
+    if losers_score < 0:
+        await interaction.response.send_message("Bud, the losers can't have a score below 0.", ephemeral=True)
+        return
+
+    # Defer immediate response window to allow network execution breathing room
+    await interaction.response.defer()
+
+    try:
+        # FIXED: Define base scoping parameters cleanly so UnboundLocalError are structurally impossible
+        winners_score = 11
+        npr_winner, npr_loser = calculate_npr(winners_score, losers_score)
+        # Overtime rule branch modification checks
+        if losers_score >= 10:
+            npr_winner = 2
+            npr_loser = 3
+            winners_score = losers_score + 2
+
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            # Pull sheet database overview mapping arrays
+            async with session.get(SHEETDB_URL) as response:
+                if response.status != 200:
+                    await interaction.followup.send("Error connecting to SheetDB.")
+                    return
+                data = await response.json()
+
+            # Isolate targeted rows
+            winner_row_1, loser_row_1 = None, None
+            winner_row_2, loser_row_2 = None, None
+            for row in data:
+                p_name = str(row.get('Player', '')).strip().lower()
+                if p_name == winners_name_1.strip().lower():
+                    winner_row_1 = row
+                if p_name == losers_name_1.strip().lower():
+                    loser_row_1 = row
+                if p_name == winners_name_2.strip().lower():
+                    winner_row_2 = row
+                if p_name == losers_name_2.strip().lower():
+                    loser_row_2 = row
+
+            if not winner_row_1 or not loser_row_1 or not winner_row_2 or not loser_row_2:
+                await interaction.followup.send(
+                    f"Profile matching failed. Double check that **{winners_name_1}**, **{winners_name_2}**, **{losers_name_1}** and **{losers_name_2}** exist on the NPA official document."
+                )
+                return
+
+            # Run tier and point calculations
+            w_rank_1, w_npr_1, w_shield_1 = process_npr_update(
+                winner_row_1.get('Rank', 'Plastic 1'),
+                winner_row_1.get('NPR (out of current ranking)', '0/10 NPR'),
+                winner_row_1.get('Rank Shield Used?', 'No'),
+                npr_winner, is_winner=True
+            )
+            w_rank_2, w_npr_2, w_shield_2 = process_npr_update(
+                winner_row_2.get('Rank', 'Plastic 1'),
+                winner_row_2.get('NPR (out of current ranking)', '0/10 NPR'),
+                winner_row_2.get('Rank Shield Used?', 'No'),
+                npr_winner, is_winner=True
+            )
+
+            l_rank_1, l_npr_1, l_shield_1 = process_npr_update(
+                loser_row_1.get('Rank', 'Plastic 1'),
+                loser_row_1.get('NPR (out of current ranking)', '0/10 NPR'),
+                loser_row_1.get('Rank Shield Used?', 'No'),
+                npr_loser, is_winner=False
+            )
+            l_rank_2, l_npr_2, l_shield_2 = process_npr_update(
+                loser_row_2.get('Rank', 'Plastic 1'),
+                loser_row_2.get('NPR (out of current ranking)', '0/10 NPR'),
+                loser_row_2.get('Rank Shield Used?', 'No'),
+                npr_loser, is_winner=False
+            )
+
+            # Patch values down to individual row cell references via unique primary key names
+            patch_winner_url_1 = f"{SHEETDB_URL}/Player/{winner_row_1.get('Player')}"
+            patch_winner_url_2 = f"{SHEETDB_URL}/Player/{winner_row_2.get('Player')}"
+            patch_loser_url_1 = f"{SHEETDB_URL}/Player/{loser_row_1.get('Player')}"
+            patch_loser_url_2 = f"{SHEETDB_URL}/Player/{loser_row_2.get('Player')}"
+
+            winner_payload_1 = {"data": {"Rank": w_rank_1, "NPR (out of current ranking)": w_npr_1, "Rank Shield Used?": w_shield_1}}
+            winner_payload_2 = {"data": {"Rank": w_rank_2, "NPR (out of current ranking)": w_npr_2, "Rank Shield Used?": w_shield_2}}
+            loser_payload_1 = {"data": {"Rank": l_rank_1, "NPR (out of current ranking)": l_npr_1, "Rank Shield Used?": l_shield_1}}
+            loser_payload_2 = {"data": {"Rank": l_rank_2, "NPR (out of current ranking)": l_npr_2, "Rank Shield Used?": l_shield_2}}
+
+            await session.patch(patch_winner_url_1, json=winner_payload_1)
+            await session.patch(patch_winner_url_2,json=winner_payload_2)
+            await session.patch(patch_loser_url_1, json=loser_payload_1)
+            await session.patch(patch_loser_url_2, json=loser_payload_2)
+            # Output single aggregated confirmation log string
+            msg = (
+                f"**Match Calculation Complete!**\n"
+                f"Score: {winners_score} to {losers_score} in favor of **{winners_name_1}** and **{winners_name_2}\n"
+                f"**{winners_name_1} (Winner):**\n"
+                f" New Rank Status: **{w_rank_1}** ({w_npr_1}) (+{npr_winner} NPR). [Shields: {w_shield_1}]\n"
+                f"**{winners_name_2} (Winner):**\n"
+                f" New Rank Status: **{w_rank_2}** ({w_npr_2}) (+{npr_winner} NPR). [Shields: {w_shield_2}]\n"
+                f"**{losers_name_1} (Loser):**\n"
+                f" New Rank Status: **{l_rank_1}** ({l_npr_1}) (-{npr_loser} NPR). [Shields: {l_shield_1}]\n"
+                f"**{losers_name_2} (Loser):**\n"
+                f" New Rank Status: **{l_rank_2}** ({l_npr_2}) (-{npr_loser} NPR). [Shields: {l_shield_2}]"
+            )
+            await interaction.followup.send(msg)
+    except asyncio.TimeoutError:
+        await interaction.followup.send("Connection timed out. SheetDB took too long to respond.")
+    except Exception as e:
+        await interaction.followup.send(f"An unexpected error occurred: {str(e)}")
+
 @client.tree.command(name="rank", description="Fetches your current rank in this season")
 @app_commands.describe(name='What is your name? (e.g., Kyle C, Maximus L)')
 async def fetch_rank(interaction: discord.Interaction, name: str):
@@ -283,8 +406,63 @@ async def fetch_rank(interaction: discord.Interaction, name: str):
     except Exception as e:
         await interaction.followup.send(f" An unexpected error occurred: {str(e)}")
 
+# leaderboard command
+@client.tree.command(name="leaderboard", description="View the top 5 players in the leaderboard for this season")
+async def get_leaderboard(interaction: discord.Interaction, name: str):
+    # Hold the interaction to prevent Discord's 3-second timeout
+    await interaction.response.defer()
 
+    # Safety timeout so the bot doesn't get stuck infinitely if the API lags
+    timeout = aiohttp.ClientTimeout(total=10)
 
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(SHEETDB_URL) as response:
+                if response.status != 200:
+                    await interaction.followup.send("❌ Failed to reach the data server.")
+                    return
+
+                # SheetDB automatically parses columns into a list of dictionaries
+                data = await response.json()
+
+                if not data:
+                    await interaction.followup.send("⚠️ The spreadsheet appears to be empty.")
+                    return
+
+                # Look through the dictionary entries
+                top_five_rows = data[:5]
+
+                columns = [
+                    "Player",
+                    "Rank",
+                    "NPR (out of current ranking)",
+                    "Rank Shield Used?",
+                    "Peak Rank (all time)"
+                ]
+
+                msg = "**Leaderboard**\n" 
+
+                for index,row in enumerate(top_five_rows , start=1):
+                    col_a = row.get(columns[0], "N/A")   
+                    col_b = row.get(columns[1], "N/A") 
+                    col_c = row.get(columns[2], "N/A") 
+                    col_d = row.get(columns[3], "N/A") 
+                    col_e = row.get(columns[4], "N/A") 
+
+                msg += (
+                    f"\n **#{index}**\n"
+                    f"{columns[0]}: {col_a}"
+                    f"{columns[1]}: {col_b}"
+                    f"{columns[2]}: {col_c}"
+                    f"{columns[3]}: {col_d}"
+                    f"{columns[4]}: {col_e}"
+                )
+                await interaction.followup.send(msg)
+
+    except asyncio.TimeoutError:
+        await interaction.followup.send(" Connection timed out. SheetDB took too long to respond.")
+    except Exception as e:
+        await interaction.followup.send(f" An unexpected error occurred: {str(e)}")
 
 # 3. Ready event
 @client.event
@@ -312,3 +490,4 @@ async def sync(ctx):
     await ctx.send(f"Synced {len(synced)} command(s) globally.")
 
 client.run(os.environ["DISCORD_BOT_TOKEN"])
+#geometry dash
