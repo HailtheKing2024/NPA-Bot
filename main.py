@@ -408,7 +408,7 @@ async def fetch_rank(interaction: discord.Interaction, name: str):
 
 # leaderboard command
 @client.tree.command(name="leaderboard", description="View the top 5 players in the leaderboard for this season")
-async def get_leaderboard(interaction: discord.Interaction, name: str):
+async def get_leaderboard(interaction: discord.Interaction):
     # Hold the interaction to prevent Discord's 3-second timeout
     await interaction.response.defer()
 
