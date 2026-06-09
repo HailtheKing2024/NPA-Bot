@@ -440,7 +440,7 @@ async def get_leaderboard(interaction: discord.Interaction):
                     "Peak Rank (all time)"
                 ]
 
-                msg = "**Leaderboard**\n" 
+                msg = "**Leaderboard**" 
 
                 for index,row in enumerate(top_five_rows , start=1):
                     col_a = row.get(columns[0], "N/A")   
