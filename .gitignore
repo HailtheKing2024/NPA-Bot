@@ -10,3 +10,6 @@ wheels/
 .venv
 npa
 .claude
+
+# Local runtime logs
+server.log
