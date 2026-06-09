@@ -138,7 +138,7 @@ client = commands.Bot(command_prefix="$", intents=intents)
 SHEETDB_URL = "https://sheetdb.io/api/v1/ra1bgaunuflkm"
 
 # 2. Slash command (will work now that client has a tree)
-@client.tree.command(name="calculate-rank", description="Logs match details, alters statistics, and parses system rank updates.")
+@client.tree.command(name="calculate-singles", description="Logs match details, alters statistics, and parses system rank updates.")
 @app_commands.describe(
     winners_name="The name of the winning player/team (e.g., Kyle C, Maximus L)",
     losers_name="The name of the losing player/team (e.g., Kyle C, Maximus L)",
@@ -231,7 +231,7 @@ async def submit_match_singles(
     except Exception as e:
         await interaction.followup.send(f"An unexpected error occurred: {str(e)}")
 
-@client.tree.command(name="doubles", description="Logs match details, alters statistics, and parses system rank updates. (Doubles version)")
+@client.tree.command(name="calculate-doubles", description="Logs match details, alters statistics, and parses system rank updates. (Doubles version)")
 @app_commands.describe(
     winners_name_1="The name of the first player on the winning team (e.g., Kyle C, Maximus L)",
     winners_name_2="The name of the second player on the winning team (e.g., Kyle C, Maximus L)",
@@ -451,10 +451,10 @@ async def get_leaderboard(interaction: discord.Interaction, name: str):
 
                 msg += (
                     f"\n **#{index}**\n"
-                    f"{columns[0]}: {col_a}"
-                    f"{columns[1]}: {col_b}"
-                    f"{columns[2]}: {col_c}"
-                    f"{columns[3]}: {col_d}"
+                    f"{columns[0]}: {col_a}\n"
+                    f"{columns[1]}: {col_b}\n"
+                    f"{columns[2]}: {col_c}\n"
+                    f"{columns[3]}: {col_d}\n"
                     f"{columns[4]}: {col_e}"
                 )
                 await interaction.followup.send(msg)
