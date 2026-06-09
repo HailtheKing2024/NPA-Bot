@@ -4,9 +4,13 @@ from discord import app_commands
 import aiohttp
 import asyncio
 import re
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
 
 RANKS_ORDER = [
-    "plastic", "iron", "bronze", "silver", "gold", 
+    "plastic", "iron", "bronze", "silver", "gold",
     "ruby", "platinum", "emerald", "diamond", "legendary", "mythic"
 ]
 
@@ -18,7 +22,7 @@ def process_npr_update(current_rank_str, current_npr_str, current_shields_str, n
     rank_cleaned = str(current_rank_str).strip().lower()
     rank_base = rank_cleaned
     tier = 1 # Default entry tier is 1
-    
+
     for r in RANKS_ORDER:
         if rank_cleaned.startswith(r):
             rank_base = r
@@ -38,7 +42,7 @@ def process_npr_update(current_rank_str, current_npr_str, current_shields_str, n
     # 3. Apply the match calculations
     if is_winner:
         npr_val += npr_change
-        
+
         # Promotion loop: Check if player exceeds the maximum cap of their cell structure
         while npr_val >= max_npr:
             npr_val -= max_npr
@@ -57,7 +61,7 @@ def process_npr_update(current_rank_str, current_npr_str, current_shields_str, n
                         break
     else:
         npr_val -= npr_change
-        
+
         # Demotion / Protection path loop
         while npr_val < 0:
             # Check if this rank allows shields
@@ -70,19 +74,19 @@ def process_npr_update(current_rank_str, current_npr_str, current_shields_str, n
             # Shield logic only applies to Tier 1 for protected ranks
             if tier == 1 and is_shield_rank:
                 shield_text = str(current_shields_str).strip().lower()
-                if "0/2" in shield_text or "No Shields Used" in shield_text or shield_text == "" in shield_text:
+                if "0/2" in shield_text or "No Shields Used" in shield_text or shield_text == "":
                     npr_val = 0 # Shield absorbs negative drop completely
                     current_shields_str = "Yes (1/2 Shields Used)"
-                    break 
+                    break
                 elif "1/2" in shield_text or "n/a" in shield_text:
                     # Second shield broken -> Demote to previous rank's highest tier (Tier 3)
-                    current_shields_str = "No Shields Used" 
+                    current_shields_str = "No Shields Used"
                     npr_val = max_npr + npr_val # Carry over negative spillover
                     if rank_base in RANKS_ORDER:
                         current_idx = RANKS_ORDER.index(rank_base)
                         if current_idx > 0:
                             rank_base = RANKS_ORDER[current_idx - 1]
-                            tier = 3 
+                            tier = 3
                         else:
                             tier = 1
                             npr_val = 0
@@ -108,10 +112,10 @@ def process_npr_update(current_rank_str, current_npr_str, current_shields_str, n
     # 4. Generate system string representations matching spreadsheet syntax
     new_rank = f"{rank_base.title()} {tier}"
     new_npr = f"{npr_val}/{max_npr} NPR"
-    
+
     if rank_base in ["ruby", "diamond"]:
         current_shields_str = "N/A"
-        
+
     return new_rank, new_npr, current_shields_str
 
 def calculate_npr(score_a, score_b):
@@ -131,7 +135,7 @@ intents.message_content = True
 
 # FIX: Use commands.Bot instead of discord.Client
 client = commands.Bot(command_prefix="$", intents=intents)
-SHEETDB_URL = "https://sheetdb.io/api/v1/ra1bgaunuflkm "
+SHEETDB_URL = "https://sheetdb.io/api/v1/ra1bgaunuflkm"
 
 # 2. Slash command (will work now that client has a tree)
 @client.tree.command(name="calculate-rank", description="Logs match details, alters statistics, and parses system rank updates.")
@@ -141,9 +145,9 @@ SHEETDB_URL = "https://sheetdb.io/api/v1/ra1bgaunuflkm "
     losers_score="The score of the losing team (0 to 9 for a normal game, > 11 for a deuce game)"
 )
 async def submit_match(
-    interaction: discord.Interaction, 
-    winners_name: str, 
-    losers_name: str, 
+    interaction: discord.Interaction,
+    winners_name: str,
+    losers_name: str,
     losers_score: int
 ):
     if losers_score < 0:
@@ -152,75 +156,80 @@ async def submit_match(
 
     # Defer immediate response window to allow network execution breathing room
     await interaction.response.defer()
-    
-    # FIXED: Define base scoping parameters cleanly so UnboundLocalErrors are structurally impossible
-    winners_score = 11
-    npr_winner, npr_loser = calculate_npr(winners_score, losers_score)
-    # Overtime rule branch modification checks
-    if losers_score >= 10:
-        npr_winner = 2
-        npr_loser = 3
-        winners_score = losers_score + 2
 
-    timeout = aiohttp.ClientTimeout(total=15)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        # Pull sheet database overview mapping arrays
-        async with session.get(SHEETDB_URL) as response:
-            if response.status != 200:
-                await interaction.followup.send("Error connecting to SheetDB.")
+    try:
+        # FIXED: Define base scoping parameters cleanly so UnboundLocalError are structurally impossible
+        winners_score = 11
+        npr_winner, npr_loser = calculate_npr(winners_score, losers_score)
+        # Overtime rule branch modification checks
+        if losers_score >= 10:
+            npr_winner = 2
+            npr_loser = 3
+            winners_score = losers_score + 2
+
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            # Pull sheet database overview mapping arrays
+            async with session.get(SHEETDB_URL) as response:
+                if response.status != 200:
+                    await interaction.followup.send("Error connecting to SheetDB.")
+                    return
+                data = await response.json()
+
+            # Isolate targeted rows
+            winner_row, loser_row = None, None
+            for row in data:
+                p_name = str(row.get('Player', '')).strip().lower()
+                if p_name == winners_name.strip().lower():
+                    winner_row = row
+                if p_name == losers_name.strip().lower():
+                    loser_row = row
+
+            if not winner_row or not loser_row:
+                await interaction.followup.send(
+                    f"Profile matching failed. Double check that **{winners_name}** and **{losers_name}** exist on your sheet data."
+                )
                 return
-            data = await response.json()
 
-        # Isolate targeted rows
-        winner_row, loser_row = None, None
-        for row in data:
-            p_name = str(row.get('Player', '')).strip().lower()
-            if p_name == winners_name.strip().lower():
-                winner_row = row
-            if p_name == losers_name.strip().lower():
-                loser_row = row
-
-        if not winner_row or not loser_row:
-            await interaction.followup.send(
-                f"Profile matching failed. Double check that **{winners_name}** and **{losers_name}** exist on your sheet data."
+            # Run tier and point calculations
+            w_rank, w_npr, w_shield = process_npr_update(
+                winner_row.get('Rank', 'Plastic 1'),
+                winner_row.get('NPR (out of current ranking)', '0/10 NPR'),
+                winner_row.get('Rank Shield Used?', 'No'),
+                npr_winner, is_winner=True
             )
-            return
 
-        # Run tier and point calculations
-        w_rank, w_npr, w_shield = process_npr_update(
-            winner_row.get('Rank', 'Plastic 1'), 
-            winner_row.get('NPR (out of current ranking)', '0/10 NPR'),
-            winner_row.get('Rank Shield Used?', 'No'),
-            npr_winner, is_winner=True
-        )
+            l_rank, l_npr, l_shield = process_npr_update(
+                loser_row.get('Rank', 'Plastic 1'),
+                loser_row.get('NPR (out of current ranking)', '0/10 NPR'),
+                loser_row.get('Rank Shield Used?', 'No'),
+                npr_loser, is_winner=False
+            )
 
-        l_rank, l_npr, l_shield = process_npr_update(
-            loser_row.get('Rank', 'Plastic 1'), 
-            loser_row.get('NPR (out of current ranking)', '0/10 NPR'),
-            loser_row.get('Rank Shield Used?', 'No'),
-            npr_loser, is_winner=False
-        )
+            # Patch values down to individual row cell references via unique primary key names
+            patch_winner_url = f"{SHEETDB_URL}/Player/{winner_row.get('Player')}"
+            patch_loser_url = f"{SHEETDB_URL}/Player/{loser_row.get('Player')}"
 
-        # Patch values down to individual row cell references via unique primary key names
-        patch_winner_url = f"{SHEETDB_URL}/Player/{winner_row.get('Player')}"
-        patch_loser_url = f"{SHEETDB_URL}/Player/{loser_row.get('Player')}"
+            winner_payload = {"data": {"Rank": w_rank, "NPR (out of current ranking)": w_npr, "Rank Shield Used?": w_shield}}
+            loser_payload = {"data": {"Rank": l_rank, "NPR (out of current ranking)": l_npr, "Rank Shield Used?": l_shield}}
 
-        winner_payload = {"data": {"Rank": w_rank, "NPR (out of current ranking)": w_npr, "Rank Shield Used?": w_shield}}
-        loser_payload = {"data": {"Rank": l_rank, "NPR (out of current ranking)": l_npr, "Rank Shield Used?": l_shield}}
+            await session.patch(patch_winner_url, json=winner_payload)
+            await session.patch(patch_loser_url, json=loser_payload)
 
-        await session.patch(patch_winner_url, json=winner_payload)
-        await session.patch(patch_loser_url, json=loser_payload)
-
-        # Output single aggregated confirmation log string
-        msg = (
-            f"**Match Calculation Complete!**\n"
-            f"Score: {winners_score} to {losers_score} in favor of **{winners_name}**\n"
-            f"**{winners_name} (Winner):**\n"
-            f" New Rank Status: **{w_rank}** ({w_npr}) (+{npr_winner} NPR). [Shields: {w_shield}]\n"
-            f"**{losers_name} (Loser):**\n"
-            f" New Rank Status: **{l_rank}** ({l_npr}) (-{npr_loser} NPR). [Shields: {l_shield}]"
-        )
-        await interaction.followup.send(msg)
+            # Output single aggregated confirmation log string
+            msg = (
+                f"**Match Calculation Complete!**\n"
+                f"Score: {winners_score} to {losers_score} in favor of **{winners_name}**\n"
+                f"**{winners_name} (Winner):**\n"
+                f" New Rank Status: **{w_rank}** ({w_npr}) (+{npr_winner} NPR). [Shields: {w_shield}]\n"
+                f"**{losers_name} (Loser):**\n"
+                f" New Rank Status: **{l_rank}** ({l_npr}) (-{npr_loser} NPR). [Shields: {l_shield}]"
+            )
+            await interaction.followup.send(msg)
+    except asyncio.TimeoutError:
+        await interaction.followup.send("Connection timed out. SheetDB took too long to respond.")
+    except Exception as e:
+        await interaction.followup.send(f"An unexpected error occurred: {str(e)}")
 
 @client.tree.command(name="rank", description="Fetches your current rank in this season")
 @app_commands.describe(name='What is your name? (e.g., Kyle C, Maximus L)')
@@ -230,7 +239,7 @@ async def fetch_rank(interaction: discord.Interaction, name: str):
 
     # Safety timeout so the bot doesn't get stuck infinitely if the API lags
     timeout = aiohttp.ClientTimeout(total=10)
-    
+
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.get(SHEETDB_URL) as response:
@@ -240,7 +249,7 @@ async def fetch_rank(interaction: discord.Interaction, name: str):
 
                 # SheetDB automatically parses columns into a list of dictionaries
                 data = await response.json()
-                
+
                 if not data:
                     await interaction.followup.send("⚠️ The spreadsheet appears to be empty.")
                     return
@@ -259,7 +268,7 @@ async def fetch_rank(interaction: discord.Interaction, name: str):
                     player_name = found_player.get('Player', 'Unknown')
                     current_rank = found_player.get('Rank', 'N/A')
                     npr_rating = found_player.get('NPR (out of current ranking)', 'N/A')
-                    
+
                     msg = (
                         f" **Profile found for {player_name}**\n"
                         f" **Rank:** {current_rank}\n"
@@ -287,10 +296,10 @@ async def on_ready():
 async def on_message(message):
     if message.author == client.user:
         return
-    
+
     if message.content.startswith('$hello'):
         await message.channel.send('Hello!')
-        
+
     # IMPORTANT: Allows prefix commands like $sync to work alongside on_message
     await client.process_commands(message)
 
@@ -302,4 +311,4 @@ async def sync(ctx):
     synced = await client.tree.sync()
     await ctx.send(f"Synced {len(synced)} command(s) globally.")
 
-client.run('YOUR_BOT_TOKEN_HERE')
+client.run(os.environ["DISCORD_BOT_TOKEN"])
