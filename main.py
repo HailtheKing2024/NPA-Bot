@@ -449,14 +449,14 @@ async def get_leaderboard(interaction: discord.Interaction, name: str):
                     col_d = row.get(columns[3], "N/A") 
                     col_e = row.get(columns[4], "N/A") 
 
-                msg += (
-                    f"\n **#{index}**\n"
-                    f"{columns[0]}: {col_a}\n"
-                    f"{columns[1]}: {col_b}\n"
-                    f"{columns[2]}: {col_c}\n"
-                    f"{columns[3]}: {col_d}\n"
-                    f"{columns[4]}: {col_e}"
-                )
+                    msg += (
+                        f"\n **#{index}**\n"
+                        f"{columns[0]}: {col_a}\n"
+                        f"{columns[1]}: {col_b}\n"
+                        f"{columns[2]}: {col_c}\n"
+                        f"{columns[3]}: {col_d}\n"
+                        f"{columns[4]}: {col_e}"
+                    )
                 await interaction.followup.send(msg)
 
     except asyncio.TimeoutError:
