@@ -62,8 +62,9 @@ def process_npr_update(current_rank_str, current_npr_str, current_shields_str, n
     else:
         npr_val -= npr_change
 
-        # Demotion / Protection path loop
+        # Demotion / Protection path loop 
         while npr_val < 0:
+                        
             # Check if this rank allows shields
             if rank_base in ["ruby", "diamond"]:
                 is_shield_rank = False
@@ -74,7 +75,7 @@ def process_npr_update(current_rank_str, current_npr_str, current_shields_str, n
             # Shield logic only applies to Tier 1 for protected ranks
             if tier == 1 and is_shield_rank:
                 shield_text = str(current_shields_str).strip().lower()
-                if "0/2" in shield_text or "No Shields Used" in shield_text or shield_text == "":
+                if "0/2" in shield_text or "no shields used" in shield_text or shield_text in ("","no"):
                     npr_val = 0 # Shield absorbs negative drop completely
                     current_shields_str = "Yes (1/2 Shields Used)"
                     break
@@ -451,11 +452,11 @@ async def get_leaderboard(interaction: discord.Interaction):
 
                     msg += (
                         f"\n **#{index}**\n"
-                        f"{columns[0]}: {col_a}\n"
-                        f"{columns[1]}: {col_b}\n"
-                        f"{columns[2]}: {col_c}\n"
-                        f"{columns[3]}: {col_d}\n"
-                        f"{columns[4]}: {col_e}"
+                        f"**{columns[0]}:** {col_a}\n"
+                        f"**{columns[1]}:** {col_b}\n"
+                        f"**{columns[2]}:** {col_c}\n"
+                        f"**{columns[3]}:** {col_d}\n"
+                        f"**{columns[4]}:** {col_e}"
                     )
                 await interaction.followup.send(msg)
 
