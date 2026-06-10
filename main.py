@@ -3,8 +3,10 @@ from discord.ext import commands
 from discord import app_commands
 import aiohttp
 import asyncio
+import json
 import re
 import os
+from urllib.parse import quote
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -38,6 +40,8 @@ def process_npr_update(current_rank_str, current_npr_str, current_shields_str, n
     if match:
         npr_val = int(match.group(1))
         max_npr = int(match.group(2))
+    if max_npr <= 0:
+        raise ValueError(f"Invalid NPR maximum: {max_npr}")
 
     # 3. Apply the match calculations
     if is_winner:
@@ -60,7 +64,11 @@ def process_npr_update(current_rank_str, current_npr_str, current_shields_str, n
                         npr_val = max_npr
                         break
     else:
+        starting_npr = npr_val
         npr_val -= npr_change
+
+        if starting_npr > 0 and npr_val < 0:
+            npr_val = 0
 
         # Demotion / Protection path loop 
         while npr_val < 0:
@@ -75,23 +83,26 @@ def process_npr_update(current_rank_str, current_npr_str, current_shields_str, n
             # Shield logic only applies to Tier 1 for protected ranks
             if tier == 1 and is_shield_rank:
                 shield_text = str(current_shields_str).strip().lower()
-                if "0/2" in shield_text or "no shields used" in shield_text or shield_text in ("","no"):
+                if "0/2" in shield_text or "no shields used" in shield_text or shield_text in ("", "no", "false"):
                     npr_val = 0 # Shield absorbs negative drop completely
                     current_shields_str = "Yes (1/2 Shields Used)"
                     break
-                elif "1/2" in shield_text or "n/a" in shield_text:
-                    # Second shield broken -> Demote to previous rank's highest tier (Tier 3)
-                    current_shields_str = "No Shields Used"
-                    npr_val = max_npr + npr_val # Carry over negative spillover
-                    if rank_base in RANKS_ORDER:
-                        current_idx = RANKS_ORDER.index(rank_base)
-                        if current_idx > 0:
-                            rank_base = RANKS_ORDER[current_idx - 1]
-                            tier = 3
-                        else:
-                            tier = 1
-                            npr_val = 0
-                    break
+
+                # Any other value means protection is already used or malformed.
+                # Demote instead of leaving npr_val unchanged and blocking the event loop.
+                current_shields_str = "No Shields Used"
+                npr_val = max_npr + npr_val # Carry over negative spillover
+                if rank_base in RANKS_ORDER:
+                    current_idx = RANKS_ORDER.index(rank_base)
+                    if current_idx > 0:
+                        rank_base = RANKS_ORDER[current_idx - 1]
+                        tier = 3
+                    else:
+                        tier = 1
+                        npr_val = 0
+                else:
+                    npr_val = 0
+                break
             else:
                 # Ruby/Diamond (any tier) or standard ranks at Tier 2 or 3 drop tiers naturally
                 if tier > 1:
@@ -137,6 +148,130 @@ intents.message_content = True
 # FIX: Use commands.Bot instead of discord.Client
 client = commands.Bot(command_prefix="$", intents=intents)
 SHEETDB_URL = "https://sheetdb.io/api/v1/ra1bgaunuflkm"
+SOURCE_COLUMNS = {
+    "Player": "A",
+    "Rank": "B",
+    "NPR (out of current ranking)": "C",
+    "Rank Shield Used?": "D",
+    "Peak Rank (all time)": "E",
+}
+LEADERBOARD_COLUMNS = {
+    "Player": "I",
+    "Rank": "J",
+    "NPR (out of current ranking)": "K",
+    "Rank Shield Used?": "L",
+    "Peak Rank (all time)": "M",
+}
+SOURCE_START_ROW = 2
+SOURCE_END_ROW = 100
+
+async def fetch_table_data(session, columns):
+    cells = [
+        f"{column}{row}"
+        for row in range(SOURCE_START_ROW, SOURCE_END_ROW + 1)
+        for column in columns.values()
+    ]
+    async with session.get(f"{SHEETDB_URL}/cells/{','.join(cells)}") as response:
+        if response.status != 200:
+            body = await response.text()
+            raise RuntimeError(f"SheetDB read failed: HTTP {response.status} {body[:200]}")
+        cell_data = await response.json()
+
+    rows = []
+    for row_number in range(SOURCE_START_ROW, SOURCE_END_ROW + 1):
+        row = {
+            field: str(cell_data.get(f"{column}{row_number}", "")).strip()
+            for field, column in columns.items()
+        }
+        if row["Player"]:
+            row["_row_number"] = str(row_number)
+            rows.append(row)
+
+    return rows
+
+async def fetch_sheet_data(session):
+    source_rows, selector_rows = await asyncio.gather(
+        fetch_table_data(session, SOURCE_COLUMNS),
+        fetch_table_data(session, LEADERBOARD_COLUMNS),
+    )
+    selectors_by_row = {
+        row["_row_number"]: str(row.get("Player", "")).strip()
+        for row in selector_rows
+    }
+
+    for row in source_rows:
+        row["_sheetdb_update_selector"] = selectors_by_row.get(row["_row_number"], "")
+
+    return source_rows
+
+async def fetch_leaderboard_data(session):
+    return await fetch_table_data(session, LEADERBOARD_COLUMNS)
+
+def find_player_row(data, player_name):
+    target_name = str(player_name).strip().lower()
+    matches = [
+        row for row in data
+        if str(row.get('Player', '')).strip().lower() == target_name
+    ]
+    if len(matches) > 1:
+        raise ValueError(f"Multiple sheet rows match player {player_name!r}.")
+    return matches[0] if matches else None
+
+async def patch_player_row(session, player_row, data):
+    player_key = str(player_row.get('Player', ''))
+    if not player_key.strip():
+        raise ValueError("Cannot update a player row with an empty Player value.")
+
+    # The sheet has duplicate headers in A:E and I:M. SheetDB matches Player
+    # against the right autosorted table, while writes land in the left table.
+    current_row = find_player_row(await fetch_sheet_data(session), player_key)
+    if current_row is None:
+        raise RuntimeError(f"SheetDB update failed for {player_key.strip()}: player row disappeared.")
+
+    update_selector = str(current_row.get("_sheetdb_update_selector", "")).strip()
+    if not update_selector:
+        raise RuntimeError(
+            f"SheetDB update failed for {player_key.strip()}: no right-table selector "
+            f"on source row {current_row.get('_row_number', 'unknown')}."
+        )
+
+    payload = {"data": data, "sheet": "Sheet1", "mode": "USER_ENTERED"}
+    patch_url = f"{SHEETDB_URL}/Player/{quote(update_selector, safe='')}"
+    async with session.patch(patch_url, json=payload) as response:
+        body = await response.text()
+        if response.status < 200 or response.status >= 300:
+            raise RuntimeError(f"SheetDB update failed for {player_key.strip()}: HTTP {response.status} {body[:200]}")
+
+    try:
+        result = json.loads(body) if body else {}
+    except json.JSONDecodeError:
+        result = {}
+
+    updated_count = result.get("updated")
+    if updated_count is not None and int(updated_count) < 1:
+        raise RuntimeError(f"SheetDB update matched 0 rows for {player_key.strip()}: {body[:200]}")
+
+    await verify_player_update(session, player_key, data)
+
+async def verify_player_update(session, player_key, expected_data):
+    expected = {key: str(value) for key, value in expected_data.items()}
+    last_seen = None
+
+    for attempt in range(3):
+        data = await fetch_table_data(session, SOURCE_COLUMNS)
+        updated_row = find_player_row(data, player_key)
+        if updated_row is not None:
+            last_seen = {key: str(updated_row.get(key, "")) for key in expected}
+            if last_seen == expected:
+                return
+
+        if attempt < 2:
+            await asyncio.sleep(0.5)
+
+    raise RuntimeError(
+        f"SheetDB verification failed for {str(player_key).strip()}: "
+        f"expected {expected}, found {last_seen}"
+    )
 
 # 2. Slash command (will work now that client has a tree)
 @client.tree.command(name="calculate-singles", description="Logs match details, alters statistics, and parses system rank updates.")
@@ -170,21 +305,9 @@ async def submit_match_singles(
 
         timeout = aiohttp.ClientTimeout(total=15)
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            # Pull sheet database overview mapping arrays
-            async with session.get(SHEETDB_URL) as response:
-                if response.status != 200:
-                    await interaction.followup.send("Error connecting to SheetDB.")
-                    return
-                data = await response.json()
-
-            # Isolate targeted rows
-            winner_row, loser_row = None, None
-            for row in data:
-                p_name = str(row.get('Player', '')).strip().lower()
-                if p_name == winners_name.strip().lower():
-                    winner_row = row
-                if p_name == losers_name.strip().lower():
-                    loser_row = row
+            data = await fetch_sheet_data(session)
+            winner_row = find_player_row(data, winners_name)
+            loser_row = find_player_row(data, losers_name)
 
             if not winner_row or not loser_row:
                 await interaction.followup.send(
@@ -207,15 +330,11 @@ async def submit_match_singles(
                 npr_loser, is_winner=False
             )
 
-            # Patch values down to individual row cell references via unique primary key names
-            patch_winner_url = f"{SHEETDB_URL}/Player/{winner_row.get('Player')}"
-            patch_loser_url = f"{SHEETDB_URL}/Player/{loser_row.get('Player')}"
+            winner_payload = {"Rank": w_rank, "NPR (out of current ranking)": w_npr, "Rank Shield Used?": w_shield}
+            loser_payload = {"Rank": l_rank, "NPR (out of current ranking)": l_npr, "Rank Shield Used?": l_shield}
 
-            winner_payload = {"data": {"Rank": w_rank, "NPR (out of current ranking)": w_npr, "Rank Shield Used?": w_shield}}
-            loser_payload = {"data": {"Rank": l_rank, "NPR (out of current ranking)": l_npr, "Rank Shield Used?": l_shield}}
-
-            await session.patch(patch_winner_url, json=winner_payload)
-            await session.patch(patch_loser_url, json=loser_payload)
+            await patch_player_row(session, winner_row, winner_payload)
+            await patch_player_row(session, loser_row, loser_payload)
 
             # Output single aggregated confirmation log string
             msg = (
@@ -267,26 +386,11 @@ async def submit_match_doubles(
 
         timeout = aiohttp.ClientTimeout(total=15)
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            # Pull sheet database overview mapping arrays
-            async with session.get(SHEETDB_URL) as response:
-                if response.status != 200:
-                    await interaction.followup.send("Error connecting to SheetDB.")
-                    return
-                data = await response.json()
-
-            # Isolate targeted rows
-            winner_row_1, loser_row_1 = None, None
-            winner_row_2, loser_row_2 = None, None
-            for row in data:
-                p_name = str(row.get('Player', '')).strip().lower()
-                if p_name == winners_name_1.strip().lower():
-                    winner_row_1 = row
-                if p_name == losers_name_1.strip().lower():
-                    loser_row_1 = row
-                if p_name == winners_name_2.strip().lower():
-                    winner_row_2 = row
-                if p_name == losers_name_2.strip().lower():
-                    loser_row_2 = row
+            data = await fetch_sheet_data(session)
+            winner_row_1 = find_player_row(data, winners_name_1)
+            winner_row_2 = find_player_row(data, winners_name_2)
+            loser_row_1 = find_player_row(data, losers_name_1)
+            loser_row_2 = find_player_row(data, losers_name_2)
 
             if not winner_row_1 or not loser_row_1 or not winner_row_2 or not loser_row_2:
                 await interaction.followup.send(
@@ -321,33 +425,27 @@ async def submit_match_doubles(
                 npr_loser, is_winner=False
             )
 
-            # Patch values down to individual row cell references via unique primary key names
-            patch_winner_url_1 = f"{SHEETDB_URL}/Player/{winner_row_1.get('Player')}"
-            patch_winner_url_2 = f"{SHEETDB_URL}/Player/{winner_row_2.get('Player')}"
-            patch_loser_url_1 = f"{SHEETDB_URL}/Player/{loser_row_1.get('Player')}"
-            patch_loser_url_2 = f"{SHEETDB_URL}/Player/{loser_row_2.get('Player')}"
+            winner_payload_1 = {"Rank": w_rank_1, "NPR (out of current ranking)": w_npr_1, "Rank Shield Used?": w_shield_1}
+            winner_payload_2 = {"Rank": w_rank_2, "NPR (out of current ranking)": w_npr_2, "Rank Shield Used?": w_shield_2}
+            loser_payload_1 = {"Rank": l_rank_1, "NPR (out of current ranking)": l_npr_1, "Rank Shield Used?": l_shield_1}
+            loser_payload_2 = {"Rank": l_rank_2, "NPR (out of current ranking)": l_npr_2, "Rank Shield Used?": l_shield_2}
 
-            winner_payload_1 = {"data": {"Rank": w_rank_1, "NPR (out of current ranking)": w_npr_1, "Rank Shield Used?": w_shield_1}}
-            winner_payload_2 = {"data": {"Rank": w_rank_2, "NPR (out of current ranking)": w_npr_2, "Rank Shield Used?": w_shield_2}}
-            loser_payload_1 = {"data": {"Rank": l_rank_1, "NPR (out of current ranking)": l_npr_1, "Rank Shield Used?": l_shield_1}}
-            loser_payload_2 = {"data": {"Rank": l_rank_2, "NPR (out of current ranking)": l_npr_2, "Rank Shield Used?": l_shield_2}}
-
-            await session.patch(patch_winner_url_1, json=winner_payload_1)
-            await session.patch(patch_winner_url_2,json=winner_payload_2)
-            await session.patch(patch_loser_url_1, json=loser_payload_1)
-            await session.patch(patch_loser_url_2, json=loser_payload_2)
+            await patch_player_row(session, winner_row_1, winner_payload_1)
+            await patch_player_row(session, winner_row_2, winner_payload_2)
+            await patch_player_row(session, loser_row_1, loser_payload_1)
+            await patch_player_row(session, loser_row_2, loser_payload_2)
             # Output single aggregated confirmation log string
             msg = (
                 f"**Match Calculation Complete!**\n"
-                f"Score: {winners_score} to {losers_score} in favor of **{winners_name_1}** and **{winners_name_2}\n**"
+                f"Score: {winners_score} to {losers_score} in favor of **{winners_name_1}** and **{winners_name_2}**\n"
                 f"**{winners_name_1} (Winner):**\n"
-                f" New Rank Status: **{w_rank_1} ({w_npr_1}) (+{npr_winner} NPR). [Shields: {w_shield_1}]**\n"
+                f" New Rank Status: **{w_rank_1}** ({w_npr_1}) (+{npr_winner} NPR). [Shields: {w_shield_1}]\n"
                 f"**{winners_name_2} (Winner):**\n"
-                f" New Rank Status: **{w_rank_2} ({w_npr_2}) (+{npr_winner} NPR). [Shields: {w_shield_2}]**\n"
+                f" New Rank Status: **{w_rank_2}** ({w_npr_2}) (+{npr_winner} NPR). [Shields: {w_shield_2}]\n"
                 f"**{losers_name_1} (Loser):**\n"
-                f" New Rank Status: **{l_rank_1} ({l_npr_1}) (-{npr_loser} NPR). [Shields: {l_shield_1}]**\n"
+                f" New Rank Status: **{l_rank_1}** ({l_npr_1}) (-{npr_loser} NPR). [Shields: {l_shield_1}]\n"
                 f"**{losers_name_2} (Loser):**\n"
-                f" New Rank Status: **{l_rank_2} ({l_npr_2}) (-{npr_loser} NPR). [Shields: {l_shield_2}]**"
+                f" New Rank Status: **{l_rank_2}** ({l_npr_2}) (-{npr_loser} NPR). [Shields: {l_shield_2}]"
             )
             await interaction.followup.send(msg)
     except asyncio.TimeoutError:
@@ -366,41 +464,27 @@ async def fetch_rank(interaction: discord.Interaction, name: str):
 
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(SHEETDB_URL) as response:
-                if response.status != 200:
-                    await interaction.followup.send("❌ Failed to reach the data server.")
-                    return
+            data = await fetch_leaderboard_data(session)
 
-                # SheetDB automatically parses columns into a list of dictionaries
-                data = await response.json()
+            if not data:
+                await interaction.followup.send("⚠️ The spreadsheet appears to be empty.")
+                return
 
-                if not data:
-                    await interaction.followup.send("⚠️ The spreadsheet appears to be empty.")
-                    return
+            found_player = find_player_row(data, name)
 
-                # Look through the dictionary entries
-                found_player = None
-                for row in data:
-                    # SheetDB uses your column headers as string keys!
-                    player_cell = row.get('Player', '')
-                    if str(player_cell).strip().lower() == name.strip().lower():
-                        found_player = row
-                        break
+            if found_player is not None:
+                player_name = found_player.get('Player', 'Unknown')
+                current_rank = found_player.get('Rank', 'N/A')
+                npr_rating = found_player.get('NPR (out of current ranking)', 'N/A')
 
-                if found_player is not None:
-                    # Match keys directly with your spreadsheet column headers
-                    player_name = found_player.get('Player', 'Unknown')
-                    current_rank = found_player.get('Rank', 'N/A')
-                    npr_rating = found_player.get('NPR (out of current ranking)', 'N/A')
-
-                    msg = (
-                        f" **Profile found for {player_name}**\n"
-                        f" **Rank:** {current_rank}\n"
-                        f" **NPR Status:** {npr_rating}"
-                    )
-                    await interaction.followup.send(msg)
-                else:
-                    await interaction.followup.send(f" Could not find any records for the name '{name}'. Check spelling and try again!")
+                msg = (
+                    f" **Profile found for {player_name}**\n"
+                    f" **Rank:** {current_rank}\n"
+                    f" **NPR Status:** {npr_rating}"
+                )
+                await interaction.followup.send(msg)
+            else:
+                await interaction.followup.send(f" Could not find any records for the name '{name}'. Check spelling and try again!")
 
     except asyncio.TimeoutError:
         await interaction.followup.send(" Connection timed out. SheetDB took too long to respond.")
@@ -418,47 +502,40 @@ async def get_leaderboard(interaction: discord.Interaction):
 
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(SHEETDB_URL) as response:
-                if response.status != 200:
-                    await interaction.followup.send("❌ Failed to reach the data server.")
-                    return
+            data = await fetch_leaderboard_data(session)
 
-                # SheetDB automatically parses columns into a list of dictionaries
-                data = await response.json()
+            if not data:
+                await interaction.followup.send("⚠️ The spreadsheet appears to be empty.")
+                return
 
-                if not data:
-                    await interaction.followup.send("⚠️ The spreadsheet appears to be empty.")
-                    return
+            top_five_rows = data[:5]
 
-                # Look through the dictionary entries
-                top_five_rows = data[:5]
+            columns = [
+                "Player",
+                "Rank",
+                "NPR (out of current ranking)",
+                "Rank Shield Used?",
+                "Peak Rank (all time)"
+            ]
 
-                columns = [
-                    "Player",
-                    "Rank",
-                    "NPR (out of current ranking)",
-                    "Rank Shield Used?",
-                    "Peak Rank (all time)"
-                ]
+            msg = "**Leaderboard**" 
 
-                msg = "**Leaderboard**" 
+            for index,row in enumerate(top_five_rows , start=1):
+                col_a = row.get(columns[0], "N/A")   
+                col_b = row.get(columns[1], "N/A") 
+                col_c = row.get(columns[2], "N/A") 
+                col_d = row.get(columns[3], "N/A") 
+                col_e = row.get(columns[4], "N/A") 
 
-                for index,row in enumerate(top_five_rows , start=1):
-                    col_a = row.get(columns[0], "N/A")   
-                    col_b = row.get(columns[1], "N/A") 
-                    col_c = row.get(columns[2], "N/A") 
-                    col_d = row.get(columns[3], "N/A") 
-                    col_e = row.get(columns[4], "N/A") 
-
-                    msg += (
-                        f"\n **#{index}**\n"
-                        f"**{columns[0]}:** {col_a}\n"
-                        f"**{columns[1]}:** {col_b}\n"
-                        f"**{columns[2]}:** {col_c}\n"
-                        f"**{columns[3]}:** {col_d}\n"
-                        f"**{columns[4]}:** {col_e}"
-                    )
-                await interaction.followup.send(msg)
+                msg += (
+                    f"\n **#{index}**\n"
+                    f"**{columns[0]}:** {col_a}\n"
+                    f"**{columns[1]}:** {col_b}\n"
+                    f"**{columns[2]}:** {col_c}\n"
+                    f"**{columns[3]}:** {col_d}\n"
+                    f"**{columns[4]}:** {col_e}"
+                )
+            await interaction.followup.send(msg)
 
     except asyncio.TimeoutError:
         await interaction.followup.send(" Connection timed out. SheetDB took too long to respond.")
