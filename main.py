@@ -339,15 +339,15 @@ async def submit_match_doubles(
             # Output single aggregated confirmation log string
             msg = (
                 f"**Match Calculation Complete!**\n"
-                f"Score: {winners_score} to {losers_score} in favor of **{winners_name_1}** and **{winners_name_2}\n"
+                f"Score: {winners_score} to {losers_score} in favor of **{winners_name_1}** and **{winners_name_2}\n**"
                 f"**{winners_name_1} (Winner):**\n"
-                f" New Rank Status: **{w_rank_1}** ({w_npr_1}) (+{npr_winner} NPR). [Shields: {w_shield_1}]\n"
+                f" New Rank Status: **{w_rank_1} ({w_npr_1}) (+{npr_winner} NPR). [Shields: {w_shield_1}]**\n"
                 f"**{winners_name_2} (Winner):**\n"
-                f" New Rank Status: **{w_rank_2}** ({w_npr_2}) (+{npr_winner} NPR). [Shields: {w_shield_2}]\n"
+                f" New Rank Status: **{w_rank_2} ({w_npr_2}) (+{npr_winner} NPR). [Shields: {w_shield_2}]**\n"
                 f"**{losers_name_1} (Loser):**\n"
-                f" New Rank Status: **{l_rank_1}** ({l_npr_1}) (-{npr_loser} NPR). [Shields: {l_shield_1}]\n"
+                f" New Rank Status: **{l_rank_1} ({l_npr_1}) (-{npr_loser} NPR). [Shields: {l_shield_1}]**\n"
                 f"**{losers_name_2} (Loser):**\n"
-                f" New Rank Status: **{l_rank_2}** ({l_npr_2}) (-{npr_loser} NPR). [Shields: {l_shield_2}]"
+                f" New Rank Status: **{l_rank_2} ({l_npr_2}) (-{npr_loser} NPR). [Shields: {l_shield_2}]**"
             )
             await interaction.followup.send(msg)
     except asyncio.TimeoutError:
