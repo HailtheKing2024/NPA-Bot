@@ -16,6 +16,62 @@ RANKS_ORDER = [
     "ruby", "platinum", "emerald", "diamond", "legendary", "mythic"
 ]
 
+RANK_MAPPING = {
+    "Plastic": 1,
+    "Iron": 2,
+    "Bronze": 3,
+    "Silver": 4,
+    "Gold": 5,
+    "Ruby": 6,
+    "Platinum": 7,
+    "Emerald": 8,
+    "Diamond": 9,
+    "Legendary": 10,
+    "Mythic": 11,
+}
+
+
+def rank_to_int(rank_str):
+    rank_name = str(rank_str).strip().split()[0].title() if str(rank_str).strip() else ""
+    return RANK_MAPPING.get(rank_name, 1)
+
+
+def calculate_bonus(winner_rank, loser_rank):
+    # If a lower-ranked player wins, bonus happens.
+    difference = loser_rank - winner_rank
+    bonus = max(0, min(10, difference))
+    return bonus
+
+
+def calculate_rank_adjustment(winner_rank, loser_rank, winner_npr, loser_npr):
+    """
+    Adjust match NPR when a higher-ranked player/team beats a lower-ranked one.
+
+    Returns positive NPR amounts for process_npr_update plus signed display
+    adjustments: (winner_npr, loser_npr, winner_adjustment, loser_adjustment).
+    """
+    winner_gain = max(0, winner_npr)
+    loser_loss = abs(loser_npr)
+    rank_gap = winner_rank - loser_rank
+
+    if rank_gap <= 0:
+        return winner_gain, loser_loss, 0, 0
+
+    adjustment = int((rank_gap / 2) + 0.5)
+    if adjustment <= 0:
+        return winner_gain, loser_loss, 0, 0
+
+    return (
+        max(0, winner_gain - adjustment),
+        max(0, loser_loss - adjustment),
+        -adjustment,
+        adjustment,
+    )
+
+
+def format_npr_delta(value):
+    return f"{value:+}"
+
 def process_npr_update(current_rank_str, current_npr_str, current_shields_str, npr_change, is_winner=True):
     """
     Applies point systems tracking Tier 1 (lowest entry) -> Tier 2 -> Tier 3 (highest tier)
@@ -137,8 +193,7 @@ def calculate_npr(score_a, score_b):
 
     rating_a = max(0, min(10, rating_a))
     rating_b = max(0, min(10, rating_b))
-    return round(rating_a), round(rating_b)
-
+    return round(rating_a,), round(rating_b)
 
 
 # 1. Setup intents
@@ -315,6 +370,25 @@ async def submit_match_singles(
                 )
                 return
 
+            w_rank_int = rank_to_int(winner_row.get('Rank', 'Plastic 1'))
+            l_rank_int = rank_to_int(loser_row.get('Rank', 'Plastic 1'))
+            winner_adjustment = 0
+            loser_adjustment = 0
+
+            if w_rank_int < l_rank_int:
+                npr_bonus = min(5, round(calculate_bonus(w_rank_int, l_rank_int)))
+                npr_winner += npr_bonus
+                npr_loser += npr_bonus
+                winner_adjustment = npr_bonus
+                loser_adjustment = -npr_bonus
+            elif w_rank_int > l_rank_int:
+                npr_winner, npr_loser, winner_adjustment, loser_adjustment = calculate_rank_adjustment(
+                    winner_rank=w_rank_int,
+                    loser_rank=l_rank_int,
+                    winner_npr=npr_winner,
+                    loser_npr=npr_loser,
+                )
+
             # Run tier and point calculations
             w_rank, w_npr, w_shield = process_npr_update(
                 winner_row.get('Rank', 'Plastic 1'),
@@ -329,6 +403,7 @@ async def submit_match_singles(
                 loser_row.get('Rank Shield Used?', 'No'),
                 npr_loser, is_winner=False
             )
+            
 
             winner_payload = {"Rank": w_rank, "NPR (out of current ranking)": w_npr, "Rank Shield Used?": w_shield}
             loser_payload = {"Rank": l_rank, "NPR (out of current ranking)": l_npr, "Rank Shield Used?": l_shield}
@@ -341,9 +416,9 @@ async def submit_match_singles(
                 f"**Match Calculation Complete!**\n"
                 f"Score: {winners_score} to {losers_score} in favor of **{winners_name}**\n"
                 f"**{winners_name} (Winner):**\n"
-                f" New Rank Status: **{w_rank}** ({w_npr}) (+{npr_winner} NPR). [Shields: {w_shield}]\n"
+                f" New Rank Status: **{w_rank}** ({w_npr}) (+{npr_winner} NPR) (Rank Balancing: {format_npr_delta(winner_adjustment)} NPR). [Shields: {w_shield}]\n"
                 f"**{losers_name} (Loser):**\n"
-                f" New Rank Status: **{l_rank}** ({l_npr}) (-{npr_loser} NPR). [Shields: {l_shield}]"
+                f" New Rank Status: **{l_rank}** ({l_npr}) (-{npr_loser} NPR) (Rank Balancing: {format_npr_delta(loser_adjustment)} NPR). [Shields: {l_shield}]"
             )
             await interaction.followup.send(msg)
     except asyncio.TimeoutError:
@@ -398,6 +473,31 @@ async def submit_match_doubles(
                 )
                 return
 
+            average_w_rank = (
+                rank_to_int(winner_row_1.get('Rank', 'Plastic 1')) +
+                rank_to_int(winner_row_2.get('Rank', 'Plastic 1'))
+            ) / 2
+            average_l_rank = (
+                rank_to_int(loser_row_1.get('Rank', 'Plastic 1')) +
+                rank_to_int(loser_row_2.get('Rank', 'Plastic 1'))
+            ) / 2
+            winner_adjustment = 0
+            loser_adjustment = 0
+
+            if average_w_rank < average_l_rank:
+                npr_bonus = min(5, round(calculate_bonus(average_w_rank, average_l_rank)))
+                npr_winner += npr_bonus
+                npr_loser += npr_bonus
+                winner_adjustment = npr_bonus
+                loser_adjustment = -npr_bonus
+            elif average_w_rank > average_l_rank:
+                npr_winner, npr_loser, winner_adjustment, loser_adjustment = calculate_rank_adjustment(
+                    winner_rank=average_w_rank,
+                    loser_rank=average_l_rank,
+                    winner_npr=npr_winner,
+                    loser_npr=npr_loser,
+                )
+
             # Run tier and point calculations
             w_rank_1, w_npr_1, w_shield_1 = process_npr_update(
                 winner_row_1.get('Rank', 'Plastic 1'),
@@ -439,13 +539,13 @@ async def submit_match_doubles(
                 f"**Match Calculation Complete!**\n"
                 f"Score: {winners_score} to {losers_score} in favor of **{winners_name_1}** and **{winners_name_2}**\n"
                 f"**{winners_name_1} (Winner):**\n"
-                f" New Rank Status: **{w_rank_1}** ({w_npr_1}) (+{npr_winner} NPR). [Shields: {w_shield_1}]\n"
+                f" New Rank Status: **{w_rank_1}** ({w_npr_1}) (+{npr_winner} NPR) (Rank Balancing: {format_npr_delta(winner_adjustment)} NPR). [Shields: {w_shield_1}]\n"
                 f"**{winners_name_2} (Winner):**\n"
-                f" New Rank Status: **{w_rank_2}** ({w_npr_2}) (+{npr_winner} NPR). [Shields: {w_shield_2}]\n"
+                f" New Rank Status: **{w_rank_2}** ({w_npr_2}) (+{npr_winner} NPR) (Rank Balancing: {format_npr_delta(winner_adjustment)} NPR). [Shields: {w_shield_2}]\n"
                 f"**{losers_name_1} (Loser):**\n"
-                f" New Rank Status: **{l_rank_1}** ({l_npr_1}) (-{npr_loser} NPR). [Shields: {l_shield_1}]\n"
+                f" New Rank Status: **{l_rank_1}** ({l_npr_1}) (-{npr_loser} NPR) (Rank Balancing: {format_npr_delta(loser_adjustment)} NPR). [Shields: {l_shield_1}]\n"
                 f"**{losers_name_2} (Loser):**\n"
-                f" New Rank Status: **{l_rank_2}** ({l_npr_2}) (-{npr_loser} NPR). [Shields: {l_shield_2}]"
+                f" New Rank Status: **{l_rank_2}** ({l_npr_2}) (-{npr_loser} NPR) (Rank Balancing: {format_npr_delta(loser_adjustment)} NPR). [Shields: {l_shield_2}]"
             )
             await interaction.followup.send(msg)
     except asyncio.TimeoutError:
@@ -541,6 +641,28 @@ async def get_leaderboard(interaction: discord.Interaction):
         await interaction.followup.send(" Connection timed out. SheetDB took too long to respond.")
     except Exception as e:
         await interaction.followup.send(f" An unexpected error occurred: {str(e)}")
+
+
+@client.tree.command(name="help", description="Need help? Start by using this command!")
+async def help_command(interaction: discord.Interaction):
+    # Hold the interaction to prevent Discord's 3-second timeout
+    await interaction.response.defer()
+    await interaction.followup.send("Hello and welcome to picklebot! This command will give you an overview of all the different commands you can observe in picklebot. Here are the commands:"
+    "- Rank: Fetch your current rank in the NPA."
+    "- Leaderboard: Fetch the current top 5 in the leaderboard"
+    "- Events: Fetch the current events ongoing in the NPA"
+    "** If we missed anything here please let us know in general! **")
+
+@client.tree.command(name="events", description="Displays the current events that are active right now, and upcoming events.")
+async def current_event(interaction: discord.Interaction):
+    # Hold the interaction to prevent Discord's 3-second timeout
+    await interaction.response.defer()
+    await interaction.followup.send("**2 Active Events Found**\n"
+                                    "**Event 1: **End of Season 3 Tournament Duo Pick'Ems**\n"
+                                    "Description: Pick your duo teammate for the end of season tournament! Get started in #tournament-info and #team.\n\n"
+                                    "**Event 2: **PROVE YOURSELF: BLOWOUT**\n"
+                                    """Description: PROVE YOURSELF: BLOWOUT EVENT. Do you think you are deserving of a higher rank? This limited time event will put your skills and move you to a more deserving rank. Here are the details:
+CHALLENGE YOUR RANK: If you think you deserve a higher rank, challenge 3 different players that are a higher rank than you to a limited time event match. To prove your skill, you must beat the higher ranked player with a score of AT MOST 6-11. If you complete all 3 games with that score, you will INSTANTLY MOVE 2 RANKS UP YOUR CURRENT RANK. If the challenging player loses even ONCE match, they do not deserve the rank and will not be placed any ranks higher. The games played in this event are NOT RANKED and will have @Recorder put in a special tag indicating that it is a event match. There are no penalties for the challenging or higher ranked players. YOU MAY ONLY CHALLENGE 3 HIGHER RANKED PLAYERS. If you fail even one game, the event and trial is over for you. Good luck and HAVE FUN!!!""")
 
 # 3. Ready event
 @client.event
