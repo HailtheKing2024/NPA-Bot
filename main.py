@@ -11,6 +11,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+
+
 RANKS_ORDER = [
     "plastic", "iron", "bronze", "silver", "gold",
     "ruby", "platinum", "emerald", "diamond", "legendary", "mythic"
@@ -647,21 +649,22 @@ async def get_leaderboard(interaction: discord.Interaction):
 async def help_command(interaction: discord.Interaction):
     # Hold the interaction to prevent Discord's 3-second timeout
     await interaction.response.defer()
-    await interaction.followup.send("Hello and welcome to picklebot! This command will give you an overview of all the different commands you can observe in picklebot. Here are the commands:"
-    "- Rank: Fetch your current rank in the NPA."
-    "- Leaderboard: Fetch the current top 5 in the leaderboard"
-    "- Events: Fetch the current events ongoing in the NPA"
-    "** If we missed anything here please let us know in general! **")
+    await interaction.followup.send("Hello and welcome to picklebot! This command will give you an overview of all the different commands you can observe in picklebot. Here are the commands: \n"
+    "/rank: Fetch your current rank in the NPA.\n"
+    "/leaderboard: Fetch the current top 5 in the leaderboard.\n"
+    "/events: Fetch the current events ongoing in the NPA.\n"
+    "/calculate-singles and /calculate-doubles are commands that are only used by recorders and the host to log match results and update the spreadsheet. If you are not a recorder or host, you will not be able to use this command, but will be able to see the results of a recorder or host using this command.\n"
+    "**Live updates to this bot will be posted in #picklebot-updates. If we missed anything here please let us know in #suggestions!**")
 
 @client.tree.command(name="events", description="Displays the current events that are active right now, and upcoming events.")
 async def current_event(interaction: discord.Interaction):
     # Hold the interaction to prevent Discord's 3-second timeout
     await interaction.response.defer()
     await interaction.followup.send("**2 Active Events Found**\n"
-                                    "**Event 1: **End of Season 3 Tournament Duo Pick'Ems**\n"
-                                    "Description: Pick your duo teammate for the end of season tournament! Get started in #tournament-info and #team.\n\n"
-                                    "**Event 2: **PROVE YOURSELF: BLOWOUT**\n"
-                                    """Description: PROVE YOURSELF: BLOWOUT EVENT. Do you think you are deserving of a higher rank? This limited time event will put your skills and move you to a more deserving rank. Here are the details:
+                                    "**Event 1:** End of Season 3 Tournament Duo Pick'Ems\n"
+                                    "**Description:** Pick your duo teammate for the end of season tournament! Get started in #tournament-info and #team.\n"
+                                    "**Event 2:** PROVE YOURSELF: BLOWOUT\n"
+                                    """**Description:** PROVE YOURSELF: BLOWOUT EVENT. Do you think you are deserving of a higher rank? This limited time event will put your skills and move you to a more deserving rank. Here are the details:
 CHALLENGE YOUR RANK: If you think you deserve a higher rank, challenge 3 different players that are a higher rank than you to a limited time event match. To prove your skill, you must beat the higher ranked player with a score of AT MOST 6-11. If you complete all 3 games with that score, you will INSTANTLY MOVE 2 RANKS UP YOUR CURRENT RANK. If the challenging player loses even ONCE match, they do not deserve the rank and will not be placed any ranks higher. The games played in this event are NOT RANKED and will have @Recorder put in a special tag indicating that it is a event match. There are no penalties for the challenging or higher ranked players. YOU MAY ONLY CHALLENGE 3 HIGHER RANKED PLAYERS. If you fail even one game, the event and trial is over for you. Good luck and HAVE FUN!!!""")
 
 # 3. Ready event
