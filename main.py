@@ -3,9 +3,11 @@ from discord.ext import commands
 from discord import app_commands
 import aiohttp
 import asyncio
+import inspect
 import json
 import re
 import os
+from collections.abc import Iterable
 from urllib.parse import quote
 from dotenv import load_dotenv
 
@@ -17,6 +19,7 @@ RANKS_ORDER = [
     "plastic", "iron", "bronze", "silver", "gold",
     "ruby", "platinum", "emerald", "diamond", "legendary", "mythic"
 ]
+MAJOR_RANK_ROLE_NAMES = {rank.title() for rank in RANKS_ORDER}
 
 RANK_MAPPING = {
     "Plastic": 1,
@@ -36,6 +39,165 @@ RANK_MAPPING = {
 def rank_to_int(rank_str):
     rank_name = str(rank_str).strip().split()[0].title() if str(rank_str).strip() else ""
     return RANK_MAPPING.get(rank_name, 1)
+
+
+def parse_rank_parts(rank_str):
+    rank_cleaned = str(rank_str).strip().lower()
+    for rank_base in RANKS_ORDER:
+        if rank_cleaned.startswith(rank_base):
+            parts = rank_cleaned.split()
+            tier = 1
+            if len(parts) > 1 and parts[-1].isdigit():
+                tier = int(parts[-1])
+            return rank_base, tier
+    return None, 1
+
+
+def rank_progress_value(rank_str):
+    rank_base, tier = parse_rank_parts(rank_str)
+    if rank_base not in RANKS_ORDER:
+        return None
+    return (RANKS_ORDER.index(rank_base) * 3) + tier
+
+
+def is_rank_up(old_rank, new_rank):
+    old_value = rank_progress_value(old_rank)
+    new_value = rank_progress_value(new_rank)
+    return old_value is not None and new_value is not None and new_value > old_value
+
+
+def major_rank_name(rank_str):
+    rank_base, _tier = parse_rank_parts(rank_str)
+    return rank_base.title() if rank_base else None
+
+
+def major_rank_increased(old_rank, new_rank):
+    old_major, _old_tier = parse_rank_parts(old_rank)
+    new_major, _new_tier = parse_rank_parts(new_rank)
+    if old_major not in RANKS_ORDER or new_major not in RANKS_ORDER:
+        return False
+    return RANKS_ORDER.index(new_major) > RANKS_ORDER.index(old_major)
+
+
+def major_rank_changed(old_rank, new_rank):
+    old_major, _old_tier = parse_rank_parts(old_rank)
+    new_major, _new_tier = parse_rank_parts(new_rank)
+    if old_major not in RANKS_ORDER or new_major not in RANKS_ORDER:
+        return False
+    return old_major != new_major
+
+
+def format_rank_up_notice(player_name, old_rank, new_rank):
+    if not is_rank_up(old_rank, new_rank):
+        return ""
+    return f" Rank Up: **{old_rank}** -> **{new_rank}**"
+
+
+def format_rank_change_notice(player_name, old_rank, new_rank):
+    old_value = rank_progress_value(old_rank)
+    new_value = rank_progress_value(new_rank)
+    if old_value is None or new_value is None or new_value == old_value:
+        return ""
+    if new_value > old_value:
+        return f" Rank Up: **{old_rank}** -> **{new_rank}**"
+    return f" Derank: **{old_rank}** -> **{new_rank}**"
+
+
+def normalize_player_name(player_name):
+    without_tags = re.sub(r"\s*\([^)]*\)", "", str(player_name).strip())
+    return re.sub(r"\s+", " ", without_tags).casefold()
+
+
+def member_name_matches(member, player_name):
+    target_name = normalize_player_name(player_name)
+    candidate_names = [
+        getattr(member, "display_name", ""),
+        getattr(member, "global_name", ""),
+        getattr(member, "name", ""),
+    ]
+    return any(normalize_player_name(candidate) == target_name for candidate in candidate_names)
+
+
+async def find_member_by_player_name(guild, player_name):
+    if guild is None:
+        return None
+
+    for member in getattr(guild, "members", []):
+        if member_name_matches(member, player_name):
+            return member
+
+    query_members = getattr(guild, "query_members", None)
+    if not callable(query_members):
+        return None
+
+    try:
+        query_result = query_members(query=str(player_name).strip(), limit=10)
+        if inspect.isawaitable(query_result):
+            queried_members = await query_result
+        else:
+            queried_members = query_result
+        if not isinstance(queried_members, Iterable) or isinstance(queried_members, (str, bytes)):
+            return None
+    except Exception:
+        return None
+
+    for member in queried_members:
+        if member_name_matches(member, player_name):
+            return member
+    return None
+
+
+def find_role_by_name(guild, role_name):
+    target_name = normalize_player_name(role_name)
+    for role in getattr(guild, "roles", []):
+        if normalize_player_name(getattr(role, "name", "")) == target_name:
+            return role
+    return None
+
+
+async def assign_rank_role_for_rank_up(guild, player_name, old_rank, new_rank):
+    if not major_rank_increased(old_rank, new_rank):
+        return ""
+    return await assign_rank_role_for_rank_change(guild, player_name, old_rank, new_rank)
+
+
+async def assign_rank_role_for_rank_change(guild, player_name, old_rank, new_rank):
+    if not major_rank_changed(old_rank, new_rank):
+        return ""
+
+    new_role_name = major_rank_name(new_rank)
+    if not new_role_name:
+        return f" Role Update: could not read the new rank role for **{player_name}**."
+
+    member = await find_member_by_player_name(guild, player_name)
+    if member is None:
+        return f" Role Update: could not find Discord member **{player_name}**."
+
+    new_role = find_role_by_name(guild, new_role_name)
+    if new_role is None:
+        return f" Role Update: missing **{new_role_name}** role."
+
+    current_roles = list(getattr(member, "roles", []))
+    rank_roles_to_remove = [
+        role for role in current_roles
+        if getattr(role, "name", "") in MAJOR_RANK_ROLE_NAMES and role != new_role
+    ]
+
+    try:
+        if rank_roles_to_remove:
+            await member.remove_roles(
+                *rank_roles_to_remove,
+                reason=f"{player_name} rank changed from {old_rank} to {new_rank}.",
+            )
+        if new_role not in getattr(member, "roles", []):
+            await member.add_roles(
+                new_role,
+                reason=f"{player_name} rank changed from {old_rank} to {new_rank}.",
+            )
+    except (discord.Forbidden, discord.HTTPException) as exc:
+        return f" Role Update: failed to assign **{new_role_name}** role ({exc})."
+
+    return f" Role Update: assigned **{new_role_name}** role."
 
 
 def calculate_bonus(winner_rank, loser_rank):
@@ -201,6 +363,7 @@ def calculate_npr(score_a, score_b):
 # 1. Setup intents
 intents = discord.Intents.default()
 intents.message_content = True
+intents.members = True
 
 # FIX: Use commands.Bot instead of discord.Client
 client = commands.Bot(command_prefix="$", intents=intents)
@@ -372,8 +535,10 @@ async def submit_match_singles(
                 )
                 return
 
-            w_rank_int = rank_to_int(winner_row.get('Rank', 'Plastic 1'))
-            l_rank_int = rank_to_int(loser_row.get('Rank', 'Plastic 1'))
+            winner_old_rank = winner_row.get('Rank', 'Plastic 1')
+            loser_old_rank = loser_row.get('Rank', 'Plastic 1')
+            w_rank_int = rank_to_int(winner_old_rank)
+            l_rank_int = rank_to_int(loser_old_rank)
             winner_adjustment = 0
             loser_adjustment = 0
 
@@ -413,14 +578,23 @@ async def submit_match_singles(
             await patch_player_row(session, winner_row, winner_payload)
             await patch_player_row(session, loser_row, loser_payload)
 
+            winner_rank_change_notice = format_rank_change_notice(winners_name, winner_old_rank, w_rank)
+            loser_rank_change_notice = format_rank_change_notice(losers_name, loser_old_rank, l_rank)
+            winner_role_notice = await assign_rank_role_for_rank_change(
+                interaction.guild, winners_name, winner_old_rank, w_rank
+            )
+            loser_role_notice = await assign_rank_role_for_rank_change(
+                interaction.guild, losers_name, loser_old_rank, l_rank
+            )
+
             # Output single aggregated confirmation log string
             msg = (
                 f"**Match Calculation Complete!**\n"
                 f"Score: {winners_score} to {losers_score} in favor of **{winners_name}**\n"
                 f"**{winners_name} (Winner):**\n"
-                f" New Rank Status: **{w_rank}** ({w_npr}) (+{npr_winner} NPR) (Rank Balancing: {format_npr_delta(winner_adjustment)} NPR). [Shields: {w_shield}]\n"
+                f" New Rank Status: **{w_rank}** ({w_npr}) (+{npr_winner} NPR) (Rank Balancing: {format_npr_delta(winner_adjustment)} NPR). [Shields: {w_shield}]{winner_rank_change_notice}{winner_role_notice}\n"
                 f"**{losers_name} (Loser):**\n"
-                f" New Rank Status: **{l_rank}** ({l_npr}) (-{npr_loser} NPR) (Rank Balancing: {format_npr_delta(loser_adjustment)} NPR). [Shields: {l_shield}]"
+                f" New Rank Status: **{l_rank}** ({l_npr}) (-{npr_loser} NPR) (Rank Balancing: {format_npr_delta(loser_adjustment)} NPR). [Shields: {l_shield}]{loser_rank_change_notice}{loser_role_notice}"
             )
             await interaction.followup.send(msg)
     except asyncio.TimeoutError:
@@ -475,13 +649,17 @@ async def submit_match_doubles(
                 )
                 return
 
+            winner_old_rank_1 = winner_row_1.get('Rank', 'Plastic 1')
+            winner_old_rank_2 = winner_row_2.get('Rank', 'Plastic 1')
+            loser_old_rank_1 = loser_row_1.get('Rank', 'Plastic 1')
+            loser_old_rank_2 = loser_row_2.get('Rank', 'Plastic 1')
             average_w_rank = (
-                rank_to_int(winner_row_1.get('Rank', 'Plastic 1')) +
-                rank_to_int(winner_row_2.get('Rank', 'Plastic 1'))
+                rank_to_int(winner_old_rank_1) +
+                rank_to_int(winner_old_rank_2)
             ) / 2
             average_l_rank = (
-                rank_to_int(loser_row_1.get('Rank', 'Plastic 1')) +
-                rank_to_int(loser_row_2.get('Rank', 'Plastic 1'))
+                rank_to_int(loser_old_rank_1) +
+                rank_to_int(loser_old_rank_2)
             ) / 2
             winner_adjustment = 0
             loser_adjustment = 0
@@ -536,18 +714,36 @@ async def submit_match_doubles(
             await patch_player_row(session, winner_row_2, winner_payload_2)
             await patch_player_row(session, loser_row_1, loser_payload_1)
             await patch_player_row(session, loser_row_2, loser_payload_2)
+
+            winner_rank_change_notice_1 = format_rank_change_notice(winners_name_1, winner_old_rank_1, w_rank_1)
+            winner_rank_change_notice_2 = format_rank_change_notice(winners_name_2, winner_old_rank_2, w_rank_2)
+            loser_rank_change_notice_1 = format_rank_change_notice(losers_name_1, loser_old_rank_1, l_rank_1)
+            loser_rank_change_notice_2 = format_rank_change_notice(losers_name_2, loser_old_rank_2, l_rank_2)
+            winner_role_notice_1 = await assign_rank_role_for_rank_change(
+                interaction.guild, winners_name_1, winner_old_rank_1, w_rank_1
+            )
+            winner_role_notice_2 = await assign_rank_role_for_rank_change(
+                interaction.guild, winners_name_2, winner_old_rank_2, w_rank_2
+            )
+            loser_role_notice_1 = await assign_rank_role_for_rank_change(
+                interaction.guild, losers_name_1, loser_old_rank_1, l_rank_1
+            )
+            loser_role_notice_2 = await assign_rank_role_for_rank_change(
+                interaction.guild, losers_name_2, loser_old_rank_2, l_rank_2
+            )
+
             # Output single aggregated confirmation log string
             msg = (
                 f"**Match Calculation Complete!**\n"
                 f"Score: {winners_score} to {losers_score} in favor of **{winners_name_1}** and **{winners_name_2}**\n"
                 f"**{winners_name_1} (Winner):**\n"
-                f" New Rank Status: **{w_rank_1}** ({w_npr_1}) (+{npr_winner} NPR) (Rank Balancing: {format_npr_delta(winner_adjustment)} NPR). [Shields: {w_shield_1}]\n"
+                f" New Rank Status: **{w_rank_1}** ({w_npr_1}) (+{npr_winner} NPR) (Rank Balancing: {format_npr_delta(winner_adjustment)} NPR). [Shields: {w_shield_1}]{winner_rank_change_notice_1}{winner_role_notice_1}\n"
                 f"**{winners_name_2} (Winner):**\n"
-                f" New Rank Status: **{w_rank_2}** ({w_npr_2}) (+{npr_winner} NPR) (Rank Balancing: {format_npr_delta(winner_adjustment)} NPR). [Shields: {w_shield_2}]\n"
+                f" New Rank Status: **{w_rank_2}** ({w_npr_2}) (+{npr_winner} NPR) (Rank Balancing: {format_npr_delta(winner_adjustment)} NPR). [Shields: {w_shield_2}]{winner_rank_change_notice_2}{winner_role_notice_2}\n"
                 f"**{losers_name_1} (Loser):**\n"
-                f" New Rank Status: **{l_rank_1}** ({l_npr_1}) (-{npr_loser} NPR) (Rank Balancing: {format_npr_delta(loser_adjustment)} NPR). [Shields: {l_shield_1}]\n"
+                f" New Rank Status: **{l_rank_1}** ({l_npr_1}) (-{npr_loser} NPR) (Rank Balancing: {format_npr_delta(loser_adjustment)} NPR). [Shields: {l_shield_1}]{loser_rank_change_notice_1}{loser_role_notice_1}\n"
                 f"**{losers_name_2} (Loser):**\n"
-                f" New Rank Status: **{l_rank_2}** ({l_npr_2}) (-{npr_loser} NPR) (Rank Balancing: {format_npr_delta(loser_adjustment)} NPR). [Shields: {l_shield_2}]"
+                f" New Rank Status: **{l_rank_2}** ({l_npr_2}) (-{npr_loser} NPR) (Rank Balancing: {format_npr_delta(loser_adjustment)} NPR). [Shields: {l_shield_2}]{loser_rank_change_notice_2}{loser_role_notice_2}"
             )
             await interaction.followup.send(msg)
     except asyncio.TimeoutError:
