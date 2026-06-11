@@ -668,6 +668,12 @@ CHALLENGE YOUR RANK: If you think you deserve a higher rank, challenge 3 differe
 @client.event
 async def on_ready():
     print(f'We have logged in as {client.user}')
+    await client.change_presence(
+        status=discord.Status.online,
+        activity=discord.CustomActivity(
+            name="🏓 | Calculating pickleball scores..." 
+        )
+    )
 
 # 4. Message event
 @client.event
