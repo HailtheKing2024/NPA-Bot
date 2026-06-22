@@ -7,6 +7,7 @@ import inspect
 import json
 import re
 import os
+import time
 from collections.abc import Iterable
 from urllib.parse import quote
 from dotenv import load_dotenv
@@ -367,7 +368,13 @@ intents.members = True
 
 # FIX: Use commands.Bot instead of discord.Client
 client = commands.Bot(command_prefix="$", intents=intents)
-SHEETDB_URL = "https://sheetdb.io/api/v1/ra1bgaunuflkm"
+SHEETDB_URL = "https://sheetdb.io/api/v1/18iq9s9aq6wdd"
+SHEETDB_MONTHLY_LIMIT = 500
+SHEETDB_WARNING_THRESHOLD = 450
+SHEETDB_REQUEST_COUNT = 0
+LEADERBOARD_CACHE_TTL_SECONDS = 60
+_leaderboard_cache_rows: list[dict[str, str]] | None = None
+_leaderboard_cache_expires_at = 0
 SOURCE_COLUMNS = {
     "Player": "A",
     "Rank": "B",
@@ -385,17 +392,59 @@ LEADERBOARD_COLUMNS = {
 SOURCE_START_ROW = 2
 SOURCE_END_ROW = 100
 
+def record_sheetdb_request():
+    global SHEETDB_REQUEST_COUNT
+    SHEETDB_REQUEST_COUNT += 1
+
+
+def reset_sheetdb_request_count():
+    global SHEETDB_REQUEST_COUNT
+    SHEETDB_REQUEST_COUNT = 0
+
+
+def get_sheetdb_request_count():
+    return SHEETDB_REQUEST_COUNT
+
+
+def format_sheetdb_budget_warning():
+    if SHEETDB_REQUEST_COUNT < SHEETDB_WARNING_THRESHOLD:
+        return ""
+    return (
+        f"\nSheetDB API usage warning: {SHEETDB_REQUEST_COUNT}/"
+        f"{SHEETDB_MONTHLY_LIMIT} requests used since this bot process started."
+    )
+
+
+def clear_leaderboard_cache():
+    global _leaderboard_cache_rows, _leaderboard_cache_expires_at
+    _leaderboard_cache_rows = None
+    _leaderboard_cache_expires_at = 0
+
+
+async def sheetdb_get_json(session, url):
+    record_sheetdb_request()
+    async with session.get(url) as response:
+        if response.status != 200:
+            body = await response.text()
+            raise RuntimeError(f"SheetDB read failed: HTTP {response.status} {body[:200]}")
+        return await response.json()
+
+
+async def sheetdb_patch_text(session, url, payload, player_key):
+    record_sheetdb_request()
+    async with session.patch(url, json=payload) as response:
+        body = await response.text()
+        if response.status < 200 or response.status >= 300:
+            raise RuntimeError(f"SheetDB update failed for {player_key.strip()}: HTTP {response.status} {body[:200]}")
+        return body
+
 async def fetch_table_data(session, columns):
     cells = [
         f"{column}{row}"
         for row in range(SOURCE_START_ROW, SOURCE_END_ROW + 1)
         for column in columns.values()
     ]
-    async with session.get(f"{SHEETDB_URL}/cells/{','.join(cells)}") as response:
-        if response.status != 200:
-            body = await response.text()
-            raise RuntimeError(f"SheetDB read failed: HTTP {response.status} {body[:200]}")
-        cell_data = await response.json()
+    cell_data = await sheetdb_get_json(session, f"{SHEETDB_URL}/cells/{','.join(cells)}")
 
     rows = []
     for row_number in range(SOURCE_START_ROW, SOURCE_END_ROW + 1):
@@ -425,7 +474,16 @@ async def fetch_sheet_data(session):
     return source_rows
 
 async def fetch_leaderboard_data(session):
-    return await fetch_table_data(session, LEADERBOARD_COLUMNS)
+    global _leaderboard_cache_rows, _leaderboard_cache_expires_at
+
+    now = time.monotonic()
+    if _leaderboard_cache_rows is not None and now < _leaderboard_cache_expires_at:
+        return [dict(row) for row in _leaderboard_cache_rows]
+
+    rows = await fetch_table_data(session, LEADERBOARD_COLUMNS)
+    _leaderboard_cache_rows = [dict(row) for row in rows]
+    _leaderboard_cache_expires_at = now + LEADERBOARD_CACHE_TTL_SECONDS
+    return [dict(row) for row in rows]
 
 def find_player_row(data, player_name):
     target_name = str(player_name).strip().lower()
@@ -444,23 +502,16 @@ async def patch_player_row(session, player_row, data):
 
     # The sheet has duplicate headers in A:E and I:M. SheetDB matches Player
     # against the right autosorted table, while writes land in the left table.
-    current_row = find_player_row(await fetch_sheet_data(session), player_key)
-    if current_row is None:
-        raise RuntimeError(f"SheetDB update failed for {player_key.strip()}: player row disappeared.")
-
-    update_selector = str(current_row.get("_sheetdb_update_selector", "")).strip()
+    update_selector = str(player_row.get("_sheetdb_update_selector", "")).strip()
     if not update_selector:
         raise RuntimeError(
             f"SheetDB update failed for {player_key.strip()}: no right-table selector "
-            f"on source row {current_row.get('_row_number', 'unknown')}."
+            f"on source row {player_row.get('_row_number', 'unknown')}."
         )
 
     payload = {"data": data, "sheet": "Sheet1", "mode": "USER_ENTERED"}
     patch_url = f"{SHEETDB_URL}/Player/{quote(update_selector, safe='')}"
-    async with session.patch(patch_url, json=payload) as response:
-        body = await response.text()
-        if response.status < 200 or response.status >= 300:
-            raise RuntimeError(f"SheetDB update failed for {player_key.strip()}: HTTP {response.status} {body[:200]}")
+    body = await sheetdb_patch_text(session, patch_url, payload, player_key)
 
     try:
         result = json.loads(body) if body else {}
@@ -471,26 +522,54 @@ async def patch_player_row(session, player_row, data):
     if updated_count is not None and int(updated_count) < 1:
         raise RuntimeError(f"SheetDB update matched 0 rows for {player_key.strip()}: {body[:200]}")
 
-    await verify_player_update(session, player_key, data)
+async def patch_player_rows(session, updates):
+    expected_updates = {}
+    for player_row, data in updates:
+        await patch_player_row(session, player_row, data)
+        player_key = str(player_row.get("Player", "")).strip()
+        expected_updates[player_key] = data
+
+    await verify_player_updates(session, expected_updates)
+    clear_leaderboard_cache()
 
 async def verify_player_update(session, player_key, expected_data):
-    expected = {key: str(value) for key, value in expected_data.items()}
-    last_seen = None
+    await verify_player_updates(session, {player_key: expected_data})
+
+
+async def verify_player_updates(session, expected_updates):
+    expected_by_player = {
+        str(player_key).strip(): {
+            key: str(value)
+            for key, value in expected_data.items()
+        }
+        for player_key, expected_data in expected_updates.items()
+    }
+    last_seen = {}
 
     for attempt in range(3):
         data = await fetch_table_data(session, SOURCE_COLUMNS)
-        updated_row = find_player_row(data, player_key)
-        if updated_row is not None:
-            last_seen = {key: str(updated_row.get(key, "")) for key in expected}
-            if last_seen == expected:
-                return
+        all_matched = True
+
+        for player_key, expected in expected_by_player.items():
+            updated_row = find_player_row(data, player_key)
+            if updated_row is None:
+                all_matched = False
+                last_seen[player_key] = None
+                continue
+
+            actual = {key: str(updated_row.get(key, "")) for key in expected}
+            last_seen[player_key] = actual
+            if actual != expected:
+                all_matched = False
+
+        if all_matched:
+            return
 
         if attempt < 2:
             await asyncio.sleep(0.5)
 
     raise RuntimeError(
-        f"SheetDB verification failed for {str(player_key).strip()}: "
-        f"expected {expected}, found {last_seen}"
+        f"SheetDB verification failed: expected {expected_by_player}, found {last_seen}"
     )
 
 # 2. Slash command (will work now that client has a tree)
@@ -575,8 +654,13 @@ async def submit_match_singles(
             winner_payload = {"Rank": w_rank, "NPR (out of current ranking)": w_npr, "Rank Shield Used?": w_shield}
             loser_payload = {"Rank": l_rank, "NPR (out of current ranking)": l_npr, "Rank Shield Used?": l_shield}
 
-            await patch_player_row(session, winner_row, winner_payload)
-            await patch_player_row(session, loser_row, loser_payload)
+            await patch_player_rows(
+                session,
+                [
+                    (winner_row, winner_payload),
+                    (loser_row, loser_payload),
+                ],
+            )
 
             winner_rank_change_notice = format_rank_change_notice(winners_name, winner_old_rank, w_rank)
             loser_rank_change_notice = format_rank_change_notice(losers_name, loser_old_rank, l_rank)
@@ -595,12 +679,15 @@ async def submit_match_singles(
                 f" New Rank Status: **{w_rank}** ({w_npr}) (+{npr_winner} NPR) (Rank Balancing: {format_npr_delta(winner_adjustment)} NPR). [Shields: {w_shield}]{winner_rank_change_notice}{winner_role_notice}\n"
                 f"**{losers_name} (Loser):**\n"
                 f" New Rank Status: **{l_rank}** ({l_npr}) (-{npr_loser} NPR) (Rank Balancing: {format_npr_delta(loser_adjustment)} NPR). [Shields: {l_shield}]{loser_rank_change_notice}{loser_role_notice}"
+                f"{format_sheetdb_budget_warning()}"
             )
             await interaction.followup.send(msg)
     except asyncio.TimeoutError:
-        await interaction.followup.send("Connection timed out. SheetDB took too long to respond.")
+        await interaction.followup.send(
+            f"Connection timed out. SheetDB took too long to respond.{format_sheetdb_budget_warning()}"
+        )
     except Exception as e:
-        await interaction.followup.send(f"An unexpected error occurred: {str(e)}")
+        await interaction.followup.send(f"An unexpected error occurred: {str(e)}{format_sheetdb_budget_warning()}")
 
 @client.tree.command(name="calculate-doubles", description="Logs match details, alters statistics, and parses system rank updates. (Doubles version)")
 @app_commands.describe(
@@ -710,10 +797,15 @@ async def submit_match_doubles(
             loser_payload_1 = {"Rank": l_rank_1, "NPR (out of current ranking)": l_npr_1, "Rank Shield Used?": l_shield_1}
             loser_payload_2 = {"Rank": l_rank_2, "NPR (out of current ranking)": l_npr_2, "Rank Shield Used?": l_shield_2}
 
-            await patch_player_row(session, winner_row_1, winner_payload_1)
-            await patch_player_row(session, winner_row_2, winner_payload_2)
-            await patch_player_row(session, loser_row_1, loser_payload_1)
-            await patch_player_row(session, loser_row_2, loser_payload_2)
+            await patch_player_rows(
+                session,
+                [
+                    (winner_row_1, winner_payload_1),
+                    (winner_row_2, winner_payload_2),
+                    (loser_row_1, loser_payload_1),
+                    (loser_row_2, loser_payload_2),
+                ],
+            )
 
             winner_rank_change_notice_1 = format_rank_change_notice(winners_name_1, winner_old_rank_1, w_rank_1)
             winner_rank_change_notice_2 = format_rank_change_notice(winners_name_2, winner_old_rank_2, w_rank_2)
@@ -744,12 +836,15 @@ async def submit_match_doubles(
                 f" New Rank Status: **{l_rank_1}** ({l_npr_1}) (-{npr_loser} NPR) (Rank Balancing: {format_npr_delta(loser_adjustment)} NPR). [Shields: {l_shield_1}]{loser_rank_change_notice_1}{loser_role_notice_1}\n"
                 f"**{losers_name_2} (Loser):**\n"
                 f" New Rank Status: **{l_rank_2}** ({l_npr_2}) (-{npr_loser} NPR) (Rank Balancing: {format_npr_delta(loser_adjustment)} NPR). [Shields: {l_shield_2}]{loser_rank_change_notice_2}{loser_role_notice_2}"
+                f"{format_sheetdb_budget_warning()}"
             )
             await interaction.followup.send(msg)
     except asyncio.TimeoutError:
-        await interaction.followup.send("Connection timed out. SheetDB took too long to respond.")
+        await interaction.followup.send(
+            f"Connection timed out. SheetDB took too long to respond.{format_sheetdb_budget_warning()}"
+        )
     except Exception as e:
-        await interaction.followup.send(f"An unexpected error occurred: {str(e)}")
+        await interaction.followup.send(f"An unexpected error occurred: {str(e)}{format_sheetdb_budget_warning()}")
 
 @client.tree.command(name="rank", description="Fetches your current rank in this season")
 @app_commands.describe(name='What is your name? (e.g., Kyle C, Maximus L)')
