@@ -67,6 +67,15 @@ def is_rank_up(old_rank, new_rank):
     return old_value is not None and new_value is not None and new_value > old_value
 
 
+def is_rank_higher(rank_a, rank_b):
+    """Return True if rank_a is strictly higher than rank_b."""
+    val_a = rank_progress_value(rank_a)
+    val_b = rank_progress_value(rank_b)
+    if val_a is None or val_b is None:
+        return False
+    return val_a > val_b
+
+
 def major_rank_name(rank_str):
     rank_base, _tier = parse_rank_parts(rank_str)
     return rank_base.title() if rank_base else None
@@ -254,6 +263,8 @@ def process_npr_update(current_rank_str, current_npr_str, current_shields_str, n
                 tier = int(parts[-1])
             break
 
+    original_rank_base = rank_base
+
     # 2. Extract current point values and the max denominator dynamically
     max_npr = 10 # Default fallback
     npr_val = 0
@@ -308,8 +319,13 @@ def process_npr_update(current_rank_str, current_npr_str, current_shields_str, n
                     npr_val = 0 # Shield absorbs negative drop completely
                     current_shields_str = "Yes (1/2 Shields Used)"
                     break
+                elif "1/2" in shield_text:
+                    # Second shield absorbs negative drop completely
+                    npr_val = 0
+                    current_shields_str = "Yes (2/2 Shields Used)"
+                    break
 
-                # Any other value means protection is already used or malformed.
+                # Any other value (e.g., 2/2 already used) means protection is gone.
                 # Demote instead of leaving npr_val unchanged and blocking the event loop.
                 current_shields_str = "No Shields Used"
                 npr_val = max_npr + npr_val # Carry over negative spillover
@@ -348,6 +364,8 @@ def process_npr_update(current_rank_str, current_npr_str, current_shields_str, n
 
     if rank_base in ["ruby", "diamond"]:
         current_shields_str = "N/A"
+    elif is_winner and rank_base != original_rank_base:
+        current_shields_str = "No"
 
     return new_rank, new_npr, current_shields_str
 
@@ -529,7 +547,12 @@ async def patch_player_rows(session, updates):
         player_key = str(player_row.get("Player", "")).strip()
         expected_updates[player_key] = data
 
-    await verify_player_updates(session, expected_updates)
+    try:
+        await verify_player_updates(session, expected_updates)
+    except RuntimeError as exc:
+        # SheetDB can have consistency delays or concurrent writes;
+        # log a warning instead of crashing the whole command.
+        print(f"SheetDB verification warning: {exc}")
     clear_leaderboard_cache()
 
 async def verify_player_update(session, player_key, expected_data):
@@ -653,6 +676,14 @@ async def submit_match_singles(
 
             winner_payload = {"Rank": w_rank, "NPR (out of current ranking)": w_npr, "Rank Shield Used?": w_shield}
             loser_payload = {"Rank": l_rank, "NPR (out of current ranking)": l_npr, "Rank Shield Used?": l_shield}
+
+            winner_peak = str(winner_row.get("Peak Rank (all time)", "")).strip()
+            if not winner_peak or is_rank_higher(w_rank, winner_peak):
+                winner_payload["Peak Rank (all time)"] = w_rank
+
+            loser_peak = str(loser_row.get("Peak Rank (all time)", "")).strip()
+            if not loser_peak or is_rank_higher(l_rank, loser_peak):
+                loser_payload["Peak Rank (all time)"] = l_rank
 
             await patch_player_rows(
                 session,
@@ -796,6 +827,22 @@ async def submit_match_doubles(
             winner_payload_2 = {"Rank": w_rank_2, "NPR (out of current ranking)": w_npr_2, "Rank Shield Used?": w_shield_2}
             loser_payload_1 = {"Rank": l_rank_1, "NPR (out of current ranking)": l_npr_1, "Rank Shield Used?": l_shield_1}
             loser_payload_2 = {"Rank": l_rank_2, "NPR (out of current ranking)": l_npr_2, "Rank Shield Used?": l_shield_2}
+
+            w1_peak = str(winner_row_1.get("Peak Rank (all time)", "")).strip()
+            if not w1_peak or is_rank_higher(w_rank_1, w1_peak):
+                winner_payload_1["Peak Rank (all time)"] = w_rank_1
+
+            w2_peak = str(winner_row_2.get("Peak Rank (all time)", "")).strip()
+            if not w2_peak or is_rank_higher(w_rank_2, w2_peak):
+                winner_payload_2["Peak Rank (all time)"] = w_rank_2
+
+            l1_peak = str(loser_row_1.get("Peak Rank (all time)", "")).strip()
+            if not l1_peak or is_rank_higher(l_rank_1, l1_peak):
+                loser_payload_1["Peak Rank (all time)"] = l_rank_1
+
+            l2_peak = str(loser_row_2.get("Peak Rank (all time)", "")).strip()
+            if not l2_peak or is_rank_higher(l_rank_2, l2_peak):
+                loser_payload_2["Peak Rank (all time)"] = l_rank_2
 
             await patch_player_rows(
                 session,
