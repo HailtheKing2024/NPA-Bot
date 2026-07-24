@@ -998,12 +998,105 @@ async def help_command(interaction: discord.Interaction):
 async def current_event(interaction: discord.Interaction):
     # Hold the interaction to prevent Discord's 3-second timeout
     await interaction.response.defer()
-    await interaction.followup.send("**2 Active Events Found**\n"
-                                    "**Event 1:** End of Season 3 Tournament Duo Pick'Ems\n"
-                                    "**Description:** Pick your duo teammate for the end of season tournament! Get started in #tournament-info and #team.\n"
+    await interaction.followup.send("**4 Active Events Found**\n"
+                                    "**Event 1:** Season 3 Tournament Playoffs Duos\n"
+                                    "**Description:** The duo tournament has started! To check if your are in and your opponents head to tournament info and find the bracket! Or run /bracket to get links to the bracket!\n"
                                     "**Event 2:** PROVE YOURSELF: BLOWOUT\n"
                                     """**Description:** PROVE YOURSELF: BLOWOUT EVENT. Do you think you are deserving of a higher rank? This limited time event will put your skills and move you to a more deserving rank. Here are the details:
-CHALLENGE YOUR RANK: If you think you deserve a higher rank, challenge 3 different players that are a higher rank than you to a limited time event match. To prove your skill, you must beat the higher ranked player with a score of AT MOST 6-11. If you complete all 3 games with that score, you will INSTANTLY MOVE 2 RANKS UP YOUR CURRENT RANK. If the challenging player loses even ONCE match, they do not deserve the rank and will not be placed any ranks higher. The games played in this event are NOT RANKED and will have @Recorder put in a special tag indicating that it is a event match. There are no penalties for the challenging or higher ranked players. YOU MAY ONLY CHALLENGE 3 HIGHER RANKED PLAYERS. If you fail even one game, the event and trial is over for you. Good luck and HAVE FUN!!!""")
+CHALLENGE YOUR RANK: If you think you deserve a higher rank, challenge 3 different players that are a higher rank than you to a limited time event match. To prove your skill, you must beat the higher ranked player with a score of AT MOST 6-11. If you complete all 3 games with that score, you will INSTANTLY MOVE 2 RANKS UP YOUR CURRENT RANK. If the challenging player loses even ONCE match, they do not deserve the rank and will not be placed any ranks higher. The games played in this event are NOT RANKED and will have @Recorder put in a special tag indicating that it is a event match. There are no penalties for the challenging or higher ranked players. YOU MAY ONLY CHALLENGE 3 HIGHER RANKED PLAYERS. If you fail even one game, the event and trial is over for you. Good luck and HAVE FUN!!!\n"""
+"**Event 3:** Season 3 Tournament Playoffs\n"
+"**Description:** The playoffs for the singles tournament started! Check the bracket in tournament info or run /bracket to get the links.\n"
+)
+@client.tree.command(name="bracket", description="Run to get bracket links for ongoing tournament")
+async def bracket_command(interaction: discord.Interaction):
+    await interaction.response.defer()
+    await interaction.followup.send("**Singles Playoff Bracket:** https://brackethq.com/b/nzaid/\n" 
+                                    "**Doubles Playoff Bracket:** https://brackethq.com/b/a4zhd/" )
+
+
+@client.tree.command(name="stats", description="NPA stats")
+async def stats(interaction: discord.Interaction):
+    await interaction.response.defer()
+
+    try:
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            data = await fetch_leaderboard_data(session)
+
+        players = [
+            row for row in data
+            if str(row.get("Player", "")).strip()
+            and str(row.get("Rank", "")).strip()
+        ]
+
+        if not players:
+            await interaction.followup.send("⚠️ No ranked players were found.")
+            return
+
+        distribution = {rank.title(): 0 for rank in RANKS_ORDER}
+        ratings = []
+
+        for player in players:
+            rank_text = str(player.get("Rank", "Plastic 1"))
+            rank_base, tier = parse_rank_parts(rank_text)
+
+            if rank_base not in RANKS_ORDER:
+                continue
+
+            distribution[rank_base.title()] += 1
+
+            npr_match = re.search(
+                r"(\d+(?:\.\d+)?)\s*/\s*(\d+(?:\.\d+)?)",
+                str(player.get("NPR (out of current ranking)", "0/10"))
+            )
+            npr_progress = 0
+
+            if npr_match:
+                current_npr = float(npr_match.group(1))
+                max_npr = float(npr_match.group(2))
+                npr_progress = (current_npr / max_npr) * 10 if max_npr else 0
+
+            rating = (
+                (RANKS_ORDER.index(rank_base) * 30)
+                + ((tier - 1) * 10)
+                + npr_progress
+            )
+
+            ratings.append((rating, player.get("Player", "Unknown"), rank_text))
+
+        if not ratings:
+            await interaction.followup.send("⚠️ No valid ranked-player data was found.")
+            return
+
+        average_rating = sum(rating[0] for rating in ratings) / len(ratings)
+        average_rank_index = min(int(average_rating // 30), len(RANKS_ORDER) - 1)
+        average_rank_remainder = average_rating % 30
+        average_tier = min(int(average_rank_remainder // 10) + 1, 3)
+        average_npr = average_rank_remainder % 10
+        average_rank = (
+            f"{RANKS_ORDER[average_rank_index].title()} "
+            f"{average_tier} ({average_npr:.1f}/10 NPR)"
+        )
+        highest_rating, highest_player, highest_rank = max(ratings, key=lambda item: item[0])
+
+        distribution_text = "\n".join(
+            f"• **{rank}:** {count}"
+            for rank, count in distribution.items()
+        )
+
+        await interaction.followup.send(
+            f"**NPA Overview**\n"
+            f"• **Total Ranked Players:** {len(ratings)}\n"
+            f"• **Average Server Rank:** {average_rank}\n"
+            f"• **Highest Rating:** {highest_rating:.1f} — **{highest_player}** ({highest_rank})\n\n"
+            f"**Rank Distribution Summary**\n"
+            f"{distribution_text}"
+        )
+
+    except Exception as e:
+        await interaction.followup.send(
+            f"⚠️ Unable to load community statistics: {str(e)}"
+        )
 
 # 3. Ready event
 @client.event
