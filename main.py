@@ -1098,6 +1098,190 @@ async def stats(interaction: discord.Interaction):
             f"⚠️ Unable to load community statistics: {str(e)}"
         )
 
+@client.tree.command(
+    name="placement",
+    description="Place a player from their first three singles games."
+)
+@app_commands.describe(
+    player_name="Player being placed",
+    opponent_1="Opponent in game 1",
+    player_score_1="Player's final score in game 1",
+    opponent_score_1="Opponent's final score in game 1",
+    opponent_2="Opponent in game 2",
+    player_score_2="Player's final score in game 2",
+    opponent_score_2="Opponent's final score in game 2",
+    opponent_3="Opponent in game 3",
+    player_score_3="Player's final score in game 3",
+    opponent_score_3="Opponent's final score in game 3",
+)
+@commands.has_any_role("Recorder", "Admin", "Host","Leaderboard Moderator", "Moderator")
+async def placement(
+    interaction: discord.Interaction,
+    player_name: str,
+    opponent_1: str,
+    player_score_1: int,
+    opponent_score_1: int,
+    opponent_2: str,
+    player_score_2: int,
+    opponent_score_2: int,
+    opponent_3: str,
+    player_score_3: int,
+    opponent_score_3: int,
+):
+    await interaction.response.defer()
+
+    try:
+        games = [
+            (opponent_1, player_score_1, opponent_score_1),
+            (opponent_2, player_score_2, opponent_score_2),
+            (opponent_3, player_score_3, opponent_score_3),
+        ]
+
+        if not player_name.strip():
+            await interaction.followup.send("⚠️ A player name is required.")
+            return
+
+        game_scores = []
+
+        for opponent_name, player_score, opponent_score in games:
+            if not opponent_name.strip():
+                await interaction.followup.send(
+                    "⚠️ Each placement game needs an opponent name."
+                )
+                return
+
+            if opponent_name.strip().lower() == player_name.strip().lower():
+                await interaction.followup.send(
+                    "⚠️ A player cannot use themself as a placement opponent."
+                )
+                return
+
+            if player_score < 0 or opponent_score < 0:
+                await interaction.followup.send("⚠️ Scores cannot be negative.")
+                return
+
+            if (
+                max(player_score, opponent_score) < 11
+                or abs(player_score - opponent_score) < 2
+            ):
+                await interaction.followup.send(
+                    "⚠️ Each game must be complete: at least 11 points and won by 2."
+                )
+                return
+
+            # Score is based only on this player's scoreline.
+            # 60 points come from total points won; winning adds 40 points.
+            total_points = player_score + opponent_score
+            game_score = (player_score / total_points) * 60
+
+            if player_score > opponent_score:
+                game_score += 40
+
+            game_scores.append(game_score)
+
+        placement_score = sum(game_scores) / len(game_scores)
+
+        # Plastic 1 = position 0; Diamond 1 = position 24.
+        # Diamond 1 is the absolute highest possible initial placement.
+        placement_position = min(
+            round((placement_score / 100) * 24),
+            24,
+        )
+
+        rank_index = placement_position // 3
+        rank_tier = (placement_position % 3) + 1
+        placed_rank = f"{RANKS_ORDER[rank_index].title()} {rank_tier}"
+        placed_npr = "0/10 NPR"
+
+        timeout = aiohttp.ClientTimeout(total=15)
+
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            data = await fetch_sheet_data(session)
+            player_row = find_player_row(data, player_name)
+
+            player_data = {
+                "Player": player_name.strip(),
+                "Rank": placed_rank,
+                "NPR (out of current ranking)": placed_npr,
+                "Rank Shield Used?": (
+                    "N/A"
+                    if placed_rank.split()[0] in ("Ruby", "Diamond")
+                    else "No"
+                ),
+                "Peak Rank (all time)": placed_rank,
+            }
+
+            if player_row:
+                current_rank = str(player_row.get("Rank", "")).strip()
+
+                if current_rank.lower() != "unranked":
+                    await interaction.followup.send(
+                        f"⚠️ **{player_name.strip()}** is already ranked as "
+                        f"**{current_rank or 'Unknown'}**. No changes were made."
+                    )
+                    return
+
+                await patch_player_rows(
+                    session,
+                    [(player_row, player_data)],
+                )
+                action = "updated"
+            else:
+                payload = {
+                    "data": [player_data],
+                    "sheet": "Sheet1",
+                    "mode": "USER_ENTERED",
+                }
+
+                record_sheetdb_request()
+
+                async with session.post(SHEETDB_URL, json=payload) as response:
+                    response_body = await response.text()
+
+                    if response.status < 200 or response.status >= 300:
+                        raise RuntimeError(
+                            f"SheetDB add failed: HTTP {response.status} "
+                            f"{response_body[:200]}"
+                        )
+
+                clear_leaderboard_cache()
+                action = "added"
+
+        role_notice = await assign_rank_role_for_rank_change(
+            interaction.guild,
+            player_name.strip(),
+            "Plastic 1",
+            placed_rank,
+        )
+
+        game_summary = "\n".join(
+            f"• vs **{opponent_name.strip()}**: {player_score}–{opponent_score}"
+            for opponent_name, player_score, opponent_score in games
+        )
+
+        await interaction.followup.send(
+            f"**Placement Complete**\n"
+            f"**Player:** {player_name.strip()} ({action} to the sheet)\n"
+            f"**Placed Rank:** {placed_rank} ({placed_npr})\n"
+            f"**Placement Score:** {placement_score:.1f}/100\n\n"
+            f"**Placement Games**\n"
+            f"{game_summary}\n"
+            f"{role_notice}"
+            f"{format_sheetdb_budget_warning()}"
+        )
+
+    except asyncio.TimeoutError:
+        await interaction.followup.send(
+            f"⚠️ The placement request timed out.{format_sheetdb_budget_warning()}"
+        )
+    except Exception as e:
+        await interaction.followup.send(
+            f"⚠️ Unable to complete placement: {str(e)}"
+            f"{format_sheetdb_budget_warning()}"
+        )
+
+
+
 # 3. Ready event
 @client.event
 async def on_ready():
