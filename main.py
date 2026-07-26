@@ -1114,7 +1114,7 @@ async def stats(interaction: discord.Interaction):
     player_score_3="Player's final score in game 3",
     opponent_score_3="Opponent's final score in game 3",
 )
-@commands.has_any_role("Recorder", "Admin", "Host","Leaderboard Moderator", "Moderator")
+@app_commands.checks.has_any_role("Recorder", "Admin", "Host", "Leaderboard Moderator", "Moderator")
 async def placement(
     interaction: discord.Interaction,
     player_name: str,
@@ -1278,6 +1278,14 @@ async def placement(
         await interaction.followup.send(
             f"⚠️ Unable to complete placement: {str(e)}"
             f"{format_sheetdb_budget_warning()}"
+        )
+@placement.error
+async def placement_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    # Check if the error was caused by the missing role check
+    if isinstance(error, app_commands.errors.MissingAnyRole):
+        await interaction.response.send_message(
+            "⛔ You do not have the required roles to use this command.", 
+            ephemeral=True # This makes the message invisible to everyone else
         )
 
 
