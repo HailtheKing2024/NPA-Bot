@@ -16,3 +16,5 @@ server.log
 .env
 
 *.zip
+.vscode
+.pytest_cache
