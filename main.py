@@ -113,6 +113,37 @@ def format_rank_change_notice(player_name, old_rank, new_rank):
     return f" Derank: **{old_rank}** -> **{new_rank}**"
 
 
+def describe_rank_gap(current_rank, peak_rank):
+    """
+    Describe how far `current_rank` is below `peak_rank` on the rank scale.
+
+    Returns a human-readable string (e.g. "2 ranks and 1 tier below peak"),
+    "At your peak rank right now" when current == peak, or None when either
+    rank can't be parsed.
+    """
+    current_value = rank_progress_value(current_rank)
+    peak_value = rank_progress_value(peak_rank)
+    if current_value is None or peak_value is None:
+        return None
+
+    gap = peak_value - current_value
+    if gap <= 0:
+        return "At your peak rank right now"
+
+    major_ranks = gap // 3
+    remaining_tiers = gap % 3
+
+    parts = []
+    if major_ranks > 0:
+        parts.append(f"{major_ranks} rank{'s' if major_ranks > 1 else ''}")
+    if remaining_tiers > 0:
+        parts.append(f"{remaining_tiers} tier{'s' if remaining_tiers > 1 else ''}")
+
+    if not parts:
+        return "At your peak rank right now"
+    return " and ".join(parts) + " below peak"
+
+
 def normalize_player_name(player_name):
     without_tags = re.sub(r"\s*\([^)]*\)", "", str(player_name).strip())
     return re.sub(r"\s+", " ", without_tags).casefold()
@@ -925,6 +956,72 @@ async def fetch_rank(interaction: discord.Interaction, name: str):
                 await interaction.followup.send(msg)
             else:
                 await interaction.followup.send(f" Could not find any records for the name '{name}'. Check spelling and try again!")
+
+    except asyncio.TimeoutError:
+        await interaction.followup.send(" Connection timed out. SheetDB took too long to respond.")
+    except Exception as e:
+        await interaction.followup.send(f" An unexpected error occurred: {str(e)}")
+
+# profile command
+@client.tree.command(name="profile", description="View a player's full profile: rank, peak rank, distance to peak, and leaderboard place.")
+@app_commands.describe(name="What is your name? (e.g., Kyle C, Maximus L)")
+async def profile(interaction: discord.Interaction, name: str):
+    # Hold the interaction to prevent Discord's 3-second timeout
+    await interaction.response.defer()
+
+    # Safety timeout so the bot doesn't get stuck infinitely if the API lags
+    timeout = aiohttp.ClientTimeout(total=10)
+
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            data = await fetch_leaderboard_data(session)
+
+            if not data:
+                await interaction.followup.send("⚠️ The spreadsheet appears to be empty.")
+                return
+
+            # The leaderboard rows are autosorted best-first, so a player's
+            # position in this list IS their leaderboard place.
+            target_name = str(name).strip().lower()
+            found_player = None
+            leaderboard_place = None
+
+            for place, row in enumerate(data, start=1):
+                if str(row.get("Player", "")).strip().lower() == target_name:
+                    if found_player is not None:
+                        await interaction.followup.send(
+                            f" Multiple records found for '{name}'. Please contact an admin to de-duplicate the sheet."
+                        )
+                        return
+                    found_player = row
+                    leaderboard_place = place
+
+            if found_player is None:
+                await interaction.followup.send(
+                    f" Could not find any records for the name '{name}'. Check spelling and try again!"
+                )
+                return
+
+            player_name = found_player.get("Player", "Unknown")
+            current_rank = str(found_player.get("Rank", "")).strip() or "N/A"
+            npr_rating = found_player.get("NPR (out of current ranking)", "N/A")
+            shield_status = found_player.get("Rank Shield Used?", "N/A")
+            peak_rank = str(found_player.get("Peak Rank (all time)", "")).strip()
+
+            gap_description = describe_rank_gap(current_rank, peak_rank) if peak_rank else None
+
+            peak_display = peak_rank or "N/A"
+            gap_display = gap_description or "N/A"
+
+            msg = (
+                f" **Profile found for {player_name}**\n"
+                f" **Rank:** {current_rank} ({npr_rating})\n"
+                f" **Peak Rank (All Time):** {peak_display}\n"
+                f" **Shields:** {shield_status}\n"
+                f" **Distance to Peak:** {gap_display}\n"
+                f" **Leaderboard Place:** #{leaderboard_place} of {len(data)}"
+            )
+            await interaction.followup.send(msg)
 
     except asyncio.TimeoutError:
         await interaction.followup.send(" Connection timed out. SheetDB took too long to respond.")
