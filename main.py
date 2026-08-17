@@ -1,7 +1,7 @@
-import discord
-from discord.ext import commands
-from discord import app_commands
-import aiohttp
+import discord # type: ignore
+from discord.ext import commands # type: ignore
+from discord import app_commands # type:ignore
+import aiohttp # type:ignore
 import asyncio
 import inspect
 import json
@@ -9,8 +9,9 @@ import re
 import os
 import time
 from collections.abc import Iterable
+from typing import Any, cast
 from urllib.parse import quote
-from dotenv import load_dotenv
+from dotenv import load_dotenv # type:ignore
 
 load_dotenv()
 
@@ -36,6 +37,21 @@ RANK_MAPPING = {
     "Mythic": 11,
 }
 
+RANK_THEMES = {
+    "plastic": (0x95A5A6, "Plastic"),
+    "iron": (0x546E7A, "Iron"),
+    "bronze": (0xCD7F32, "Bronze"),
+    "silver": (0xBDC3C7, "Silver"),
+    "gold": (0xF1C40F, "Gold"),
+    "ruby": (0xE74C3C, "Ruby"),
+    "platinum": (0x00CED1, "Platinum"),
+    "emerald": (0x2ECC71, "Emerald"),
+    "diamond": (0x3498DB, "Diamond"),
+    "legendary": (0xE67E22, "Legendary"),
+    "mythic": (0x9B59B6, "Mythic"),
+}
+DEFAULT_RANK_THEME = (0x5865F2, "NPA")
+
 
 def rank_to_int(rank_str):
     rank_name = str(rank_str).strip().split()[0].title() if str(rank_str).strip() else ""
@@ -52,6 +68,24 @@ def parse_rank_parts(rank_str):
                 tier = int(parts[-1])
             return rank_base, tier
     return None, 1
+
+
+def get_rank_theme(rank_str):
+    rank_base, _tier = parse_rank_parts(rank_str)
+    return RANK_THEMES.get(rank_base or "", DEFAULT_RANK_THEME)
+
+
+def format_npr_progress(npr_str, width=10):
+    match = re.search(r"(-?\d+(?:\.\d+)?)\s*/\s*(\d+(?:\.\d+)?)", str(npr_str))
+    if not match:
+        return str(npr_str).strip() or "N/A"
+
+    current, maximum = (float(value) for value in match.groups())
+    if maximum <= 0:
+        return str(npr_str).strip()
+
+    filled = max(0, min(width, round((current / maximum) * width)))
+    return f"{'▰' * filled}{'▱' * (width - filled)} {current:g}/{maximum:g} NPR"
 
 
 def rank_progress_value(rank_str):
@@ -534,6 +568,184 @@ async def fetch_leaderboard_data(session):
     _leaderboard_cache_expires_at = now + LEADERBOARD_CACHE_TTL_SECONDS
     return [dict(row) for row in rows]
 
+
+async def player_name_autocomplete(interaction, current):
+    # Autocomplete must not create SheetDB traffic for every typed character.
+    if not _leaderboard_cache_rows:
+        return []
+
+    query = current.casefold().strip()
+    names = sorted({str(row.get("Player", "")).strip() for row in _leaderboard_cache_rows})
+    matches = [name for name in names if name and query in name.casefold()]
+    return [app_commands.Choice(name=name, value=name) for name in matches[:25]]
+
+
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+SUPABASE_ENABLED = bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY)
+
+
+async def supabase_rpc(session, function_name, payload):
+    if not SUPABASE_ENABLED:
+        return None
+    url = f"{SUPABASE_URL}/rest/v1/rpc/{quote(function_name, safe='')}"
+    headers = {
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        "Content-Type": "application/json",
+    }
+    async with session.post(url, headers=headers, json=payload) as response:
+        body = await response.text()
+        if response.status < 200 or response.status >= 300:
+            raise RuntimeError(f"Supabase RPC {function_name} failed: HTTP {response.status} {body[:200]}")
+        return await response.json() if body else None
+
+
+def build_match_history_payload(match_type, winner_score, loser_score, participants):
+    return {
+        "p_match_type": match_type,
+        "p_winner_score": winner_score,
+        "p_loser_score": loser_score,
+        "p_participants": [
+            {
+                "player_name": participant["player_name"],
+                "is_winner": participant["is_winner"],
+                "rank_before": participant["rank_before"],
+                "rank_after": participant["rank_after"],
+                "npr_before": participant["npr_before"],
+                "npr_after": participant["npr_after"],
+            }
+            for participant in participants
+        ],
+    }
+
+
+async def record_match_history(session, match_type, winner_score, loser_score, participants):
+    if not SUPABASE_ENABLED:
+        return None
+    payload = build_match_history_payload(match_type, winner_score, loser_score, participants)
+    try:
+        return await supabase_rpc(session, "record_match", payload)
+    except Exception as exc:
+        print(f"Supabase match logging warning: {exc}")
+        return None
+
+
+async def fetch_player_streak(session, player_name):
+    if not SUPABASE_ENABLED:
+        return None
+    try:
+        return await supabase_rpc(
+            session,
+            "player_streak",
+            {"p_player_name": normalize_player_name(player_name)},
+        )
+    except Exception as exc:
+        print(f"Supabase streak fetch warning: {exc}")
+        return None
+
+
+async def fetch_head_to_head(session, player_a, player_b):
+    if not SUPABASE_ENABLED:
+        return None
+    try:
+        return await supabase_rpc(
+            session,
+            "head_to_head",
+            {
+                "p_player_a": normalize_player_name(player_a),
+                "p_player_b": normalize_player_name(player_b),
+            },
+        )
+    except Exception as exc:
+        print(f"Supabase h2h fetch warning: {exc}")
+        return None
+
+
+def leaderboard_embed(rows, page, page_size):
+    start = page * page_size
+    page_rows = rows[start:start + page_size]
+    embed = discord.Embed(
+        title="NPA Leaderboard",
+        color=discord.Colour.blurple(),
+    )
+
+    lines = []
+    for position, row in enumerate(page_rows, start=start + 1):
+        medal = {1: "1.", 2: "2.", 3: "3."}.get(position, f"{position}.")
+        rank = str(row.get("Rank", "N/A"))
+        _color, label = get_rank_theme(rank)
+        npr = format_npr_progress(row.get("NPR (out of current ranking)", "N/A"))
+        name = str(row.get("Player", "Unknown"))
+        lines.append(f"**{medal} {name}**\n{label} | {rank} | {npr}")
+
+    embed.description = "\n\n".join(lines) or "No ranked players found."
+    page_count = max(1, (len(rows) + page_size - 1) // page_size)
+    embed.set_footer(text=f"Page {page + 1} of {page_count} | {len(rows)} players | {page_size} per page")
+    return embed
+
+
+class LeaderboardView(discord.ui.View):
+    def __init__(self, rows, owner_id, page_size=5):
+        super().__init__(timeout=120)
+        self.rows = rows
+        self.owner_id = owner_id
+        self.page_size = page_size
+        self.page = 0
+        self.message: discord.WebhookMessage | None = None
+        self.update_buttons()
+
+    @property
+    def page_count(self):
+        return max(1, (len(self.rows) + self.page_size - 1) // self.page_size)
+
+    def update_buttons(self):
+        buttons = [
+            cast(discord.ui.Button, item)
+            for item in self.children
+            if isinstance(item, discord.ui.Button)
+        ]
+        previous_button, next_button, page_size_button = buttons
+        previous_button.disabled = self.page == 0
+        next_button.disabled = self.page >= self.page_count - 1
+        page_size_button.label = f"Show {10 if self.page_size == 5 else 5}"
+
+    def current_embed(self):
+        return leaderboard_embed(self.rows, self.page, self.page_size)
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id == self.owner_id:
+            return True
+        await interaction.response.send_message("Only the command user can change this leaderboard.", ephemeral=True)
+        return False
+
+    @discord.ui.button(label="Previous", style=discord.ButtonStyle.secondary)
+    async def previous_button(self, interaction, button):
+        self.page -= 1
+        self.update_buttons()
+        await interaction.response.edit_message(embed=self.current_embed(), view=self)
+
+    @discord.ui.button(label="Next", style=discord.ButtonStyle.secondary)
+    async def next_button(self, interaction, button):
+        self.page += 1
+        self.update_buttons()
+        await interaction.response.edit_message(embed=self.current_embed(), view=self)
+
+    @discord.ui.button(label="Show 10", style=discord.ButtonStyle.primary)
+    async def page_size_button(self, interaction, button):
+        first_position = self.page * self.page_size
+        self.page_size = 10 if self.page_size == 5 else 5
+        self.page = first_position // self.page_size
+        self.update_buttons()
+        await interaction.response.edit_message(embed=self.current_embed(), view=self)
+
+    async def on_timeout(self):
+        for item in self.children:
+            if isinstance(item, discord.ui.Button):
+                item.disabled = True
+        if self.message is not None:
+            await self.message.edit(view=self)
+
 def find_player_row(data, player_name):
     target_name = str(player_name).strip().lower()
     matches = [
@@ -633,6 +845,7 @@ async def verify_player_updates(session, expected_updates):
     losers_name="The name of the losing player/team (e.g., Kyle C, Maximus L)",
     losers_score="The score of the losing team (0 to 9 for a normal game, > 11 for a deuce game)"
 )
+@app_commands.autocomplete(winners_name=player_name_autocomplete, losers_name=player_name_autocomplete)
 async def submit_match_singles(
     interaction: discord.Interaction,
     winners_name: str,
@@ -724,6 +937,31 @@ async def submit_match_singles(
                 ],
             )
 
+            await record_match_history(
+                session,
+                "singles",
+                winners_score,
+                losers_score,
+                [
+                    {
+                        "player_name": winners_name,
+                        "is_winner": True,
+                        "rank_before": winner_old_rank,
+                        "rank_after": w_rank,
+                        "npr_before": winner_row.get("NPR (out of current ranking)", "0/10 NPR"),
+                        "npr_after": w_npr,
+                    },
+                    {
+                        "player_name": losers_name,
+                        "is_winner": False,
+                        "rank_before": loser_old_rank,
+                        "rank_after": l_rank,
+                        "npr_before": loser_row.get("NPR (out of current ranking)", "0/10 NPR"),
+                        "npr_after": l_npr,
+                    },
+                ],
+            )
+
             winner_rank_change_notice = format_rank_change_notice(winners_name, winner_old_rank, w_rank)
             loser_rank_change_notice = format_rank_change_notice(losers_name, loser_old_rank, l_rank)
             winner_role_notice = await assign_rank_role_for_rank_change(
@@ -733,17 +971,27 @@ async def submit_match_singles(
                 interaction.guild, losers_name, loser_old_rank, l_rank
             )
 
-            # Output single aggregated confirmation log string
-            msg = (
-                f"**Match Calculation Complete!**\n"
-                f"Score: {winners_score} to {losers_score} in favor of **{winners_name}**\n"
-                f"**{winners_name} (Winner):**\n"
-                f" New Rank Status: **{w_rank}** ({w_npr}) (+{npr_winner} NPR) (Rank Balancing: {format_npr_delta(winner_adjustment)} NPR). [Shields: {w_shield}]{winner_rank_change_notice}{winner_role_notice}\n"
-                f"**{losers_name} (Loser):**\n"
-                f" New Rank Status: **{l_rank}** ({l_npr}) (-{npr_loser} NPR) (Rank Balancing: {format_npr_delta(loser_adjustment)} NPR). [Shields: {l_shield}]{loser_rank_change_notice}{loser_role_notice}"
-                f"{format_sheetdb_budget_warning()}"
+            color, _label = get_rank_theme(w_rank)
+            embed = discord.Embed(
+                title="Match Recorded",
+                description=f"**Score:** {winners_score}-{losers_score}",
+                color=discord.Colour(color),
             )
-            await interaction.followup.send(msg)
+            embed.add_field(
+                name=f"Winner: {winners_name}",
+                value=(f"**{w_rank}**\n{format_npr_progress(w_npr)} | +{npr_winner} NPR\n"
+                       f"Balance: {format_npr_delta(winner_adjustment)} | Shields: {w_shield}"
+                       f"{winner_rank_change_notice}{winner_role_notice}"),
+                inline=False,
+            )
+            embed.add_field(
+                name=f"Loser: {losers_name}",
+                value=(f"**{l_rank}**\n{format_npr_progress(l_npr)} | -{npr_loser} NPR\n"
+                       f"Balance: {format_npr_delta(loser_adjustment)} | Shields: {l_shield}"
+                       f"{loser_rank_change_notice}{loser_role_notice}"),
+                inline=False,
+            )
+            await interaction.followup.send(embed=embed)
     except asyncio.TimeoutError:
         await interaction.followup.send(
             f"Connection timed out. SheetDB took too long to respond.{format_sheetdb_budget_warning()}"
@@ -758,6 +1006,12 @@ async def submit_match_singles(
     losers_name_1="The name of the first player on the losing team (e.g., Kyle C, Maximus L)",
     losers_name_2="The name of the second player on the losing team (e.g., Kyle C, Maximus L)",
     losers_score="The score of the losing team (0 to 9 for a normal game, > 11 for a deuce game)"
+)
+@app_commands.autocomplete(
+    winners_name_1=player_name_autocomplete,
+    winners_name_2=player_name_autocomplete,
+    losers_name_1=player_name_autocomplete,
+    losers_name_2=player_name_autocomplete,
 )
 async def submit_match_doubles(
     interaction: discord.Interaction,
@@ -885,6 +1139,47 @@ async def submit_match_doubles(
                 ],
             )
 
+            await record_match_history(
+                session,
+                "doubles",
+                winners_score,
+                losers_score,
+                [
+                    {
+                        "player_name": winners_name_1,
+                        "is_winner": True,
+                        "rank_before": winner_old_rank_1,
+                        "rank_after": w_rank_1,
+                        "npr_before": winner_row_1.get("NPR (out of current ranking)", "0/10 NPR"),
+                        "npr_after": w_npr_1,
+                    },
+                    {
+                        "player_name": winners_name_2,
+                        "is_winner": True,
+                        "rank_before": winner_old_rank_2,
+                        "rank_after": w_rank_2,
+                        "npr_before": winner_row_2.get("NPR (out of current ranking)", "0/10 NPR"),
+                        "npr_after": w_npr_2,
+                    },
+                    {
+                        "player_name": losers_name_1,
+                        "is_winner": False,
+                        "rank_before": loser_old_rank_1,
+                        "rank_after": l_rank_1,
+                        "npr_before": loser_row_1.get("NPR (out of current ranking)", "0/10 NPR"),
+                        "npr_after": l_npr_1,
+                    },
+                    {
+                        "player_name": losers_name_2,
+                        "is_winner": False,
+                        "rank_before": loser_old_rank_2,
+                        "rank_after": l_rank_2,
+                        "npr_before": loser_row_2.get("NPR (out of current ranking)", "0/10 NPR"),
+                        "npr_after": l_npr_2,
+                    },
+                ],
+            )
+
             winner_rank_change_notice_1 = format_rank_change_notice(winners_name_1, winner_old_rank_1, w_rank_1)
             winner_rank_change_notice_2 = format_rank_change_notice(winners_name_2, winner_old_rank_2, w_rank_2)
             loser_rank_change_notice_1 = format_rank_change_notice(losers_name_1, loser_old_rank_1, l_rank_1)
@@ -902,21 +1197,24 @@ async def submit_match_doubles(
                 interaction.guild, losers_name_2, loser_old_rank_2, l_rank_2
             )
 
-            # Output single aggregated confirmation log string
-            msg = (
-                f"**Match Calculation Complete!**\n"
-                f"Score: {winners_score} to {losers_score} in favor of **{winners_name_1}** and **{winners_name_2}**\n"
-                f"**{winners_name_1} (Winner):**\n"
-                f" New Rank Status: **{w_rank_1}** ({w_npr_1}) (+{npr_winner} NPR) (Rank Balancing: {format_npr_delta(winner_adjustment)} NPR). [Shields: {w_shield_1}]{winner_rank_change_notice_1}{winner_role_notice_1}\n"
-                f"**{winners_name_2} (Winner):**\n"
-                f" New Rank Status: **{w_rank_2}** ({w_npr_2}) (+{npr_winner} NPR) (Rank Balancing: {format_npr_delta(winner_adjustment)} NPR). [Shields: {w_shield_2}]{winner_rank_change_notice_2}{winner_role_notice_2}\n"
-                f"**{losers_name_1} (Loser):**\n"
-                f" New Rank Status: **{l_rank_1}** ({l_npr_1}) (-{npr_loser} NPR) (Rank Balancing: {format_npr_delta(loser_adjustment)} NPR). [Shields: {l_shield_1}]{loser_rank_change_notice_1}{loser_role_notice_1}\n"
-                f"**{losers_name_2} (Loser):**\n"
-                f" New Rank Status: **{l_rank_2}** ({l_npr_2}) (-{npr_loser} NPR) (Rank Balancing: {format_npr_delta(loser_adjustment)} NPR). [Shields: {l_shield_2}]{loser_rank_change_notice_2}{loser_role_notice_2}"
-                f"{format_sheetdb_budget_warning()}"
+            color, _label = get_rank_theme(w_rank_1)
+            embed = discord.Embed(
+                title="Doubles Match Recorded",
+                description=f"**Score:** {winners_score}-{losers_score}",
+                color=discord.Colour(color),
             )
-            await interaction.followup.send(msg)
+            for player, rank, npr, shields, delta, balance, notice, role_notice in (
+                (winners_name_1, w_rank_1, w_npr_1, w_shield_1, f"+{npr_winner}", winner_adjustment, winner_rank_change_notice_1, winner_role_notice_1),
+                (winners_name_2, w_rank_2, w_npr_2, w_shield_2, f"+{npr_winner}", winner_adjustment, winner_rank_change_notice_2, winner_role_notice_2),
+                (losers_name_1, l_rank_1, l_npr_1, l_shield_1, f"-{npr_loser}", loser_adjustment, loser_rank_change_notice_1, loser_role_notice_1),
+                (losers_name_2, l_rank_2, l_npr_2, l_shield_2, f"-{npr_loser}", loser_adjustment, loser_rank_change_notice_2, loser_role_notice_2),
+            ):
+                embed.add_field(
+                    name=player,
+                    value=f"**{rank}** | {delta} NPR\n{format_npr_progress(npr)}\nBalance: {format_npr_delta(balance)} | Shields: {shields}{notice}{role_notice}",
+                    inline=False,
+                )
+            await interaction.followup.send(embed=embed)
     except asyncio.TimeoutError:
         await interaction.followup.send(
             f"Connection timed out. SheetDB took too long to respond.{format_sheetdb_budget_warning()}"
@@ -926,6 +1224,7 @@ async def submit_match_doubles(
 
 @client.tree.command(name="rank", description="Fetches your current rank in this season")
 @app_commands.describe(name='What is your name? (e.g., Kyle C, Maximus L)')
+@app_commands.autocomplete(name=player_name_autocomplete)
 async def fetch_rank(interaction: discord.Interaction, name: str):
     # Hold the interaction to prevent Discord's 3-second timeout
     await interaction.response.defer()
@@ -947,13 +1246,14 @@ async def fetch_rank(interaction: discord.Interaction, name: str):
                 player_name = found_player.get('Player', 'Unknown')
                 current_rank = found_player.get('Rank', 'N/A')
                 npr_rating = found_player.get('NPR (out of current ranking)', 'N/A')
-
-                msg = (
-                    f" **Profile found for {player_name}**\n"
-                    f" **Rank:** {current_rank}\n"
-                    f" **NPR Status:** {npr_rating}"
+                color, label = get_rank_theme(current_rank)
+                embed = discord.Embed(
+                    title=f"{player_name}'s Rank",
+                    color=discord.Colour(color),
                 )
-                await interaction.followup.send(msg)
+                embed.add_field(name="Rank", value=f"{label} | **{current_rank}**", inline=False)
+                embed.add_field(name="NPR", value=format_npr_progress(npr_rating), inline=False)
+                await interaction.followup.send(embed=embed)
             else:
                 await interaction.followup.send(f" Could not find any records for the name '{name}'. Check spelling and try again!")
 
@@ -965,6 +1265,7 @@ async def fetch_rank(interaction: discord.Interaction, name: str):
 # profile command
 @client.tree.command(name="profile", description="View a player's full profile: rank, peak rank, distance to peak, and leaderboard place.")
 @app_commands.describe(name="What is your name? (e.g., Kyle C, Maximus L)")
+@app_commands.autocomplete(name=player_name_autocomplete)
 async def profile(interaction: discord.Interaction, name: str):
     # Hold the interaction to prevent Discord's 3-second timeout
     await interaction.response.defer()
@@ -1013,24 +1314,101 @@ async def profile(interaction: discord.Interaction, name: str):
             peak_display = peak_rank or "N/A"
             gap_display = gap_description or "N/A"
 
-            msg = (
-                f" **Profile found for {player_name}**\n"
-                f" **Rank:** {current_rank} ({npr_rating})\n"
-                f" **Peak Rank (All Time):** {peak_display}\n"
-                f" **Shields:** {shield_status}\n"
-                f" **Distance to Peak:** {gap_display}\n"
-                f" **Leaderboard Place:** #{leaderboard_place} of {len(data)}"
-            )
-            await interaction.followup.send(msg)
+            color, label = get_rank_theme(current_rank)
+            embed = discord.Embed(
+                title=f"{player_name}'s Profile",
+                color=discord.Colour(color),
+)
+            embed.add_field(name="Current Rank", value=f"{label} | **{current_rank}**", inline=False)
+            embed.add_field(name="NPR Progress", value=format_npr_progress(npr_rating), inline=False)
+            embed.add_field(name="Peak Rank", value=peak_display, inline=True)
+            embed.add_field(name="Shields", value=shield_status, inline=True)
+            embed.add_field(name="Distance to Peak", value=gap_display, inline=False)
+
+            streak_data = await fetch_player_streak(session, player_name)
+            if streak_data and isinstance(streak_data, list) and streak_data:
+                streak = int(streak_data[0].get("streak", 0))
+                if streak > 0:
+                    streak_text = f"{streak} win streak 🔥"
+                elif streak < 0:
+                    streak_text = f"{abs(streak)} loss streak ❌"
+                else:
+                    streak_text = "No matches recorded"
+            else:
+                streak_text = "No matches recorded"
+            embed.add_field(name="Current Streak", value=streak_text, inline=False)
+
+            embed.set_footer(text=f"Leaderboard place #{leaderboard_place} of {len(data)}")
+            await interaction.followup.send(embed=embed)
 
     except asyncio.TimeoutError:
         await interaction.followup.send(" Connection timed out. SheetDB took too long to respond.")
     except Exception as e:
         await interaction.followup.send(f" An unexpected error occurred: {str(e)}")
 
+# head-to-head command
+@client.tree.command(name="h2h", description="Head-to-head record between two players")
+@app_commands.describe(
+    player_a="First player",
+    player_b="Second player",
+)
+@app_commands.autocomplete(player_a=player_name_autocomplete, player_b=player_name_autocomplete)
+async def head_to_head(interaction: discord.Interaction, player_a: str, player_b: str):
+    await interaction.response.defer()
+
+    try:
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            data = await fetch_head_to_head(session, player_a, player_b)
+
+            if not data or not isinstance(data, list):
+                embed = discord.Embed(
+                    title="Head to Head",
+                    description="No head-to-head matches recorded between these players yet.",
+                    color=discord.Colour.blurple(),
+                )
+                await interaction.followup.send(embed=embed)
+                return
+
+            player_a_name = data[0].get("player_a", player_a)
+            player_b_name = data[0].get("player_b", player_b)
+            matches_played = int(data[0].get("matches_played", 0))
+            player_a_wins = int(data[0].get("player_a_wins", 0))
+            player_b_wins = int(data[0].get("player_b_wins", 0))
+
+            embed = discord.Embed(
+                title=f"{player_a_name} vs {player_b_name}",
+                color=discord.Colour.blurple(),
+            )
+            embed.add_field(name="Matches Played", value=str(matches_played), inline=False)
+            embed.add_field(name=player_a_name, value=f"{player_a_wins} wins", inline=True)
+            embed.add_field(name=player_b_name, value=f"{player_b_wins} wins", inline=True)
+
+            recent_lines = []
+            for record in data[:5]:
+                winner_name = record.get("winner_name", "Unknown")
+                loser_name = record.get("loser_name", "Unknown")
+                score = f"{record.get('winner_score')}-{record.get('loser_score')}"
+                played_at = str(record.get("played_at", ""))[:10]
+                recent_lines.append(
+                    f"**{winner_name}** defeated **{loser_name}** {score} ({played_at})"
+                )
+            if recent_lines:
+                embed.add_field(name="Recent Meetings", value="\n".join(recent_lines), inline=False)
+
+            await interaction.followup.send(embed=embed)
+    except asyncio.TimeoutError:
+        await interaction.followup.send(" Connection timed out while fetching head-to-head data.")
+    except Exception as e:
+        await interaction.followup.send(f" An unexpected error occurred: {str(e)}")
+
 # leaderboard command
-@client.tree.command(name="leaderboard", description="View the top 5 players in the leaderboard for this season")
-async def get_leaderboard(interaction: discord.Interaction):
+@client.tree.command(name="leaderboard", description="Browse the season leaderboard")
+@app_commands.choices(page_size=[
+    app_commands.Choice(name="5 players (detailed)", value=5),
+    app_commands.Choice(name="10 players (compact)", value=10),
+])
+async def get_leaderboard(interaction: discord.Interaction, page_size: int = 5):
     # Hold the interaction to prevent Discord's 3-second timeout
     await interaction.response.defer()
 
@@ -1045,34 +1423,8 @@ async def get_leaderboard(interaction: discord.Interaction):
                 await interaction.followup.send("⚠️ The spreadsheet appears to be empty.")
                 return
 
-            top_five_rows = data[:5]
-
-            columns = [
-                "Player",
-                "Rank",
-                "NPR (out of current ranking)",
-                "Rank Shield Used?",
-                "Peak Rank (all time)"
-            ]
-
-            msg = "**Leaderboard**" 
-
-            for index,row in enumerate(top_five_rows , start=1):
-                col_a = row.get(columns[0], "N/A")   
-                col_b = row.get(columns[1], "N/A") 
-                col_c = row.get(columns[2], "N/A") 
-                col_d = row.get(columns[3], "N/A") 
-                col_e = row.get(columns[4], "N/A") 
-
-                msg += (
-                    f"\n **#{index}**\n"
-                    f"**{columns[0]}:** {col_a}\n"
-                    f"**{columns[1]}:** {col_b}\n"
-                    f"**{columns[2]}:** {col_c}\n"
-                    f"**{columns[3]}:** {col_d}\n"
-                    f"**{columns[4]}:** {col_e}"
-                )
-            await interaction.followup.send(msg)
+            view = LeaderboardView(data, interaction.user.id, page_size)
+            view.message = await interaction.followup.send(embed=view.current_embed(), view=view, wait=True)
 
     except asyncio.TimeoutError:
         await interaction.followup.send(" Connection timed out. SheetDB took too long to respond.")
@@ -1084,12 +1436,23 @@ async def get_leaderboard(interaction: discord.Interaction):
 async def help_command(interaction: discord.Interaction):
     # Hold the interaction to prevent Discord's 3-second timeout
     await interaction.response.defer()
-    await interaction.followup.send("Hello and welcome to picklebot! This command will give you an overview of all the different commands you can observe in picklebot. Here are the commands: \n"
-    "/rank: Fetch your current rank in the NPA.\n"
-    "/leaderboard: Fetch the current top 5 in the leaderboard.\n"
-    "/events: Fetch the current events ongoing in the NPA.\n"
-    "/calculate-singles and /calculate-doubles are commands that are only used by recorders and the host to log match results and update the spreadsheet. If you are not a recorder or host, you will not be able to use this command, but will be able to see the results of a recorder or host using this command.\n"
-    "**Live updates to this bot will be posted in #picklebot-updates. If we missed anything here please let us know in #suggestions!**")
+    embed = discord.Embed(title="NPA Bot Help", color=discord.Colour.blurple())
+    embed.add_field(
+        name="Players",
+        value="`/rank` - current rank\n`/profile` - full player profile\n`/leaderboard` - browse all players\n`/stats` - community overview\n`/h2h` - head-to-head record",
+        inline=False,
+    )
+    embed.add_field(
+        name="League",
+        value="`/events` - active events\n`/bracket` - tournament brackets",
+        inline=False,
+    )
+    embed.add_field(
+        name="Recorders and Hosts",
+        value="`/calculate-singles`, `/calculate-doubles`, and `/placement` update player records.",
+        inline=False,
+    )
+    await interaction.followup.send(embed=embed)
 
 @client.tree.command(name="events", description="Displays the current events that are active right now, and upcoming events.")
 async def current_event(interaction: discord.Interaction):
@@ -1181,14 +1544,16 @@ async def stats(interaction: discord.Interaction):
             for rank, count in distribution.items()
         )
 
-        await interaction.followup.send(
-            f"**NPA Overview**\n"
-            f"• **Total Ranked Players:** {len(ratings)}\n"
-            f"• **Average Server Rank:** {average_rank}\n"
-            f"• **Highest Rating:** {highest_rating:.1f} — **{highest_player}** ({highest_rank})\n\n"
-            f"**Rank Distribution Summary**\n"
-            f"{distribution_text}"
+        embed = discord.Embed(title="NPA Overview", color=discord.Colour.blurple())
+        embed.add_field(name="Ranked Players", value=str(len(ratings)), inline=True)
+        embed.add_field(name="Average Rank", value=average_rank, inline=True)
+        embed.add_field(
+            name="Highest Rating",
+            value=f"{highest_rating:.1f} - **{highest_player}** ({highest_rank})",
+            inline=False,
         )
+        embed.add_field(name="Rank Distribution", value=distribution_text, inline=False)
+        await interaction.followup.send(embed=embed)
 
     except Exception as e:
         await interaction.followup.send(
@@ -1212,6 +1577,12 @@ async def stats(interaction: discord.Interaction):
     opponent_score_3="Opponent's final score in game 3",
 )
 @app_commands.checks.has_any_role("Recorder", "Admin", "Host", "Leaderboard Moderator", "Moderator")
+@app_commands.autocomplete(
+    player_name=player_name_autocomplete,
+    opponent_1=player_name_autocomplete,
+    opponent_2=player_name_autocomplete,
+    opponent_3=player_name_autocomplete,
+)
 async def placement(
     interaction: discord.Interaction,
     player_name: str,
@@ -1356,16 +1727,16 @@ async def placement(
             for opponent_name, player_score, opponent_score in games
         )
 
-        await interaction.followup.send(
-            f"**Placement Complete**\n"
-            f"**Player:** {player_name.strip()} ({action} to the sheet)\n"
-            f"**Placed Rank:** {placed_rank} ({placed_npr})\n"
-            f"**Placement Score:** {placement_score:.1f}/100\n\n"
-            f"**Placement Games**\n"
-            f"{game_summary}\n"
-            f"{role_notice}"
-            f"{format_sheetdb_budget_warning()}"
-        )
+        color, _label = get_rank_theme(placed_rank)
+        embed = discord.Embed(title="Placement Complete", color=discord.Colour(color))
+        embed.add_field(name="Player", value=f"{player_name.strip()} ({action})", inline=True)
+        embed.add_field(name="Placed Rank", value=f"{placed_rank}\n{format_npr_progress(placed_npr)}", inline=True)
+        embed.add_field(name="Placement Score", value=f"{placement_score:.1f}/100", inline=False)
+        embed.add_field(name="Placement Games", value=game_summary, inline=False)
+        footer = f"{role_notice}{format_sheetdb_budget_warning()}".strip()
+        if footer:
+            embed.set_footer(text=footer)
+        await interaction.followup.send(embed=embed)
 
     except asyncio.TimeoutError:
         await interaction.followup.send(
@@ -1418,5 +1789,5 @@ async def sync(ctx):
     synced = await client.tree.sync()
     await ctx.send(f"Synced {len(synced)} command(s) globally.")
 
-client.run(os.environ["DISCORD_BOT_TOKEN"])
-#geometry dash
+if __name__ == "__main__":
+    client.run(os.environ["DISCORD_BOT_TOKEN"])
